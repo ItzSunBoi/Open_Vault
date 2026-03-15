@@ -22,7 +22,10 @@ except Exception:
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-WWW = os.path.join(os.path.dirname(__file__), 'www')
+BASE_DIR = os.path.dirname(__file__)
+WWW = os.path.join(BASE_DIR, 'www')
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+GAME_DATA_PATH = os.path.join(DATA_DIR, 'game_data.json')
 
 def create_client():
     client_id = os.urandom(16).hex()
@@ -150,54 +153,16 @@ clients    = {}          # client_id -> info dict
 leaderboard   = []
 _glock = threading.Lock()   # guards rooms / clients / leaderboard / global_online
 
-# ── Word / question data ──────────────────────────────────────────────────────
-DRAWING_WORDS = [
-    'apple','house','cat','dog','tree','sun','car','fish','book','door',
-    'phone','chair','table','cloud','bird','star','moon','boat','flower',
-    'pizza','guitar','robot','castle','dragon','rocket','diamond','crown',
-    'bridge','beach','mountain','forest','piano','camera','umbrella','clock',
-    'train','bicycle','elephant','penguin','volcano','rainbow','snowflake',
-]
+# ── External game data ────────────────────────────────────────────────────────
+def load_game_data():
+    with open(GAME_DATA_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data
 
-SYLLABLES = [
-    'TH','ER','ING','ON','AN','ST','RE','AT','OR','EN',
-    'IT','IS','IN','AL','LE','HE','ED','EA','OU','DE',
-    'CH','AR','NT','ES','EL','TE','PH','RI','ND','UN',
-    'EE','OW','AY','OM','PL','TR','GR','BR','SH','WH',
-]
-
-TRIVIA_QUESTIONS = [
-    {"q":"What is the capital of France?",               "a":"Paris",          "opts":["London","Berlin","Paris","Madrid"]},
-    {"q":"How many sides does a hexagon have?",           "a":"6",              "opts":["5","6","7","8"]},
-    {"q":"What planet is known as the Red Planet?",      "a":"Mars",           "opts":["Venus","Jupiter","Mars","Saturn"]},
-    {"q":"Who painted the Mona Lisa?",                   "a":"Da Vinci",       "opts":["Picasso","Da Vinci","Rembrandt","Monet"]},
-    {"q":"What is the chemical symbol for gold?",        "a":"Au",             "opts":["Go","Gd","Au","Ag"]},
-    {"q":"How many bones are in the human body?",        "a":"206",            "opts":["185","196","206","214"]},
-    {"q":"What is the largest ocean?",                   "a":"Pacific",        "opts":["Atlantic","Indian","Pacific","Arctic"]},
-    {"q":"In what year did WW2 end?",                    "a":"1945",           "opts":["1943","1944","1945","1946"]},
-    {"q":"What is the speed of light (approx)?",         "a":"300,000 km/s",   "opts":["150,000 km/s","200,000 km/s","300,000 km/s","400,000 km/s"]},
-    {"q":"Who wrote Romeo and Juliet?",                  "a":"Shakespeare",    "opts":["Dickens","Shakespeare","Austen","Tolkien"]},
-    {"q":"What is the smallest planet in our solar system?","a":"Mercury",     "opts":["Mars","Pluto","Mercury","Venus"]},
-    {"q":"How many players on a football (soccer) team?","a":"11",             "opts":["9","10","11","12"]},
-    {"q":"What language has the most native speakers?",  "a":"Mandarin",       "opts":["English","Spanish","Mandarin","Hindi"]},
-    {"q":"What is H2O?",                                 "a":"Water",          "opts":["Oxygen","Hydrogen","Water","Helium"]},
-    {"q":"What year did the Titanic sink?",              "a":"1912",           "opts":["1908","1910","1912","1915"]},
-    {"q":"What is the longest river in the world?",      "a":"Nile",           "opts":["Amazon","Yangtze","Nile","Congo"]},
-    {"q":"What is 12 x 12?",                             "a":"144",            "opts":["124","132","144","148"]},
-    {"q":"Which country invented pizza?",                "a":"Italy",          "opts":["Greece","Italy","France","USA"]},
-    {"q":"What gas do plants absorb from the air?",      "a":"CO2",            "opts":["O2","N2","CO2","H2"]},
-    {"q":"How many continents are there?",               "a":"7",              "opts":["5","6","7","8"]},
-    {"q":"What is the capital of Japan?",                "a":"Tokyo",          "opts":["Osaka","Kyoto","Tokyo","Hiroshima"]},
-    {"q":"What animal is the fastest on land?",          "a":"Cheetah",        "opts":["Lion","Horse","Cheetah","Greyhound"]},
-    {"q":"Who was the first person on the moon?",        "a":"Neil Armstrong", "opts":["Buzz Aldrin","Neil Armstrong","Yuri Gagarin","John Glenn"]},
-    {"q":"What is the square root of 144?",              "a":"12",             "opts":["10","11","12","14"]},
-    {"q":"Which element has atomic number 1?",           "a":"Hydrogen",       "opts":["Helium","Hydrogen","Lithium","Carbon"]},
-    {"q":"What is the largest country by area?",         "a":"Russia",         "opts":["USA","Canada","China","Russia"]},
-    {"q":"What is the powerhouse of the cell?",          "a":"Mitochondria",   "opts":["Nucleus","Ribosome","Mitochondria","Vacuole"]},
-    {"q":"What year did the Berlin Wall fall?",          "a":"1989",           "opts":["1987","1988","1989","1991"]},
-    {"q":"How many strings does a standard guitar have?","a":"6",              "opts":["4","5","6","7"]},
-    {"q":"What is the most spoken language in Brazil?",  "a":"Portuguese",     "opts":["Spanish","Portuguese","English","French"]},
-]
+GAME_DATA = load_game_data()
+DRAWING_WORDS = GAME_DATA.get('drawing_words', [])
+WORD_BOMB_SYLLABLES = GAME_DATA.get('wordbomb_syllables', {})
+TRIVIA_QUESTIONS = GAME_DATA.get('trivia_questions', [])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def ws_send(client_id, data):
@@ -577,8 +542,17 @@ def next_word_turn(room):
         if not room['players'][room['current_player_index']]['eliminated'] or tries >= len(room['players']):
             break
     player = room['players'][room['current_player_index']]
-    room['syllable'] = rand_item(SYLLABLES)
-    time_limit = max(5, 12 - room['round'] // max(len(alive), 1))
+    round_num = room.get('round', 0)
+    if round_num < 4:
+        pool = WORD_BOMB_SYLLABLES.get('easy', [])
+    elif round_num < 8:
+        pool = WORD_BOMB_SYLLABLES.get('medium', [])
+    else:
+        pool = WORD_BOMB_SYLLABLES.get('hard', [])
+    if not pool:
+        pool = WORD_BOMB_SYLLABLES.get('easy', []) + WORD_BOMB_SYLLABLES.get('medium', []) + WORD_BOMB_SYLLABLES.get('hard', [])
+    room['syllable'] = rand_item(pool)
+    time_limit = max(5, 12 - round_num // max(len(alive), 1))
     player_list = get_player_list(room)
     for i, p in enumerate(player_list):
         p['active'] = room['players'][i]['name'] == player['name']
