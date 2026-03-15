@@ -1,26 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key = 'urlmask:' + location.pathname;
-  var token = sessionStorage.getItem(key);
-  if (!token) {
-    token = Math.random().toString(36).substr(2,10);
-    sessionStorage.setItem(key, token);
-  }
-  // Keep gameTokenMap updated so /x/ redirects work too
-  try {
-    var map = JSON.parse(sessionStorage.getItem('gameTokenMap') || '{}');
-    map[token] = location.pathname + location.search;
-    sessionStorage.setItem('gameTokenMap', JSON.stringify(map));
-  } catch(e) {}
-  // Only rewrite if not already on /x/
-  if (location.pathname !== '/x/') {
-    history.replaceState(null, '', '/x/?t=' + token);
-  }
-})();
-</script>
+<script src="/http-socket.js"></script>
+<script src="/multiplayer-common.js"></script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Chess — GameVault</title>
@@ -68,12 +51,18 @@
   .promo-piece{font-size:48px;cursor:pointer;padding:8px;border-radius:8px;transition:background .15s;}
   .promo-piece:hover{background:rgba(0,204,68,0.2);}
   @media(max-width:600px){#board{grid-template-columns:repeat(8,42px);grid-template-rows:repeat(8,42px);}.sq{width:42px;height:42px;font-size:26px;}.coords-file span{width:42px;}}
+
+  .ping-badge{font-family:'Orbitron',monospace;font-size:11px;color:rgba(224,240,255,0.55);border:1px solid rgba(255,255,255,0.12);padding:4px 8px;border-radius:999px;}
+  .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
+  .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
+  .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
 </style>
 </head>
 <body>
 <header>
   <a class="back" href="/games">← Back</a>
   <h1>CHESS</h1>
+  <div class="ping-badge" id="ping-badge">Ping -- ms</div>
 </header>
 <div class="layout">
   <div>
@@ -110,9 +99,7 @@
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const roomId = params.get('room') || Math.random().toString(36).substr(2,6).toUpperCase();
-const playerName = params.get('name') || localStorage.getItem('playerName') || 'Player';
+const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 
 document.getElementById('room-code').textContent = roomId;
 
@@ -244,6 +231,7 @@ function copyRoom() {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  GameVaultMP.bindPingDisplay(ws, 'ping-badge');
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'chess' }));
   };

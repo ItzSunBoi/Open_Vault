@@ -1,5 +1,5 @@
 """
-GameVault — Flask WebSocket Server
+GameVault — Flask HTTP multiplayer server
 All games: Drawing Party, Word Bomb, Chess, Pong, Battleship, Trivia, Bomberman
 
 Run:
@@ -7,31 +7,133 @@ Run:
     python app.py
 
 Behind nginx (recommended for SSL / Cloudflare Tunnel):
-    gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
-             -w 1 --bind 127.0.0.1:5000 app:app
+    gunicorn -w 1 --threads 8 --bind 127.0.0.1:5000 app:app
 """
 
 import os, json, random, time, threading
-from flask import Flask, send_from_directory, abort
-from flask_sock import Sock
+from functools import lru_cache
+from flask import Flask, send_from_directory, abort, request, jsonify, Response
+
+try:
+    from wordfreq import zipf_frequency
+except Exception:
+    zipf_frequency = None
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.config['SOCK_SERVER_OPTIONS'] = {'ping_interval': 25}
-sock = Sock(app)
 
 WWW = os.path.join(os.path.dirname(__file__), 'www')
+
+def create_client():
+    client_id = os.urandom(16).hex()
+    now = time.time()
+    clients[client_id] = {
+        'name': None, 'room': None, 'game': None,
+        'queue': [], 'cond': threading.Condition(), 'alive': True,
+        'created_at': now, 'last_seen': now,
+    }
+    return client_id
+
+
+def touch_client(client_id):
+    info = clients.get(client_id)
+    if info:
+        info['last_seen'] = time.time()
+
+
+def disconnect_client(client_id):
+    info = clients.get(client_id)
+    if not info:
+        return
+    info['alive'] = False
+    leave_room(client_id)
+    cond = info.get('cond')
+    if cond is not None:
+        with cond:
+            cond.notify_all()
+    clients.pop(client_id, None)
+    broadcast_stats()
+
+
+@app.post('/api/socket/open')
+def api_socket_open():
+    client_id = create_client()
+    broadcast_stats()
+    return jsonify({'clientId': client_id})
+
+
+@app.post('/api/socket/send')
+def api_socket_send():
+    data = request.get_json(silent=True) or {}
+    client_id = data.get('clientId')
+    raw = data.get('message')
+    if client_id not in clients:
+        return jsonify({'ok': False, 'closed': True})
+    touch_client(client_id)
+    try:
+        msg = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return jsonify({'error': 'invalid message'}), 400
+    if not isinstance(msg, dict):
+        return jsonify({'error': 'message must be an object'}), 400
+    handle_message(client_id, msg)
+    return jsonify({'ok': True})
+
+
+@app.get('/api/socket/poll')
+def api_socket_poll():
+    client_id = request.args.get('clientId', '')
+    timeout = min(max(float(request.args.get('timeout', '25')), 0), 30)
+    info = clients.get(client_id)
+    if not info:
+        return jsonify({'closed': True, 'messages': []})
+    touch_client(client_id)
+    cond = info['cond']
+    deadline = time.time() + timeout
+    with cond:
+        while info.get('alive', True) and not info['queue']:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            cond.wait(timeout=remaining)
+        if not info.get('alive', True):
+            return jsonify({'closed': True})
+        messages = info['queue'][:]
+        info['queue'].clear()
+    return Response(json.dumps({'messages': messages}), mimetype='application/json')
+
+
+@app.post('/api/socket/close')
+def api_socket_close():
+    data = request.get_json(silent=True) or {}
+    client_id = data.get('clientId')
+    if client_id in clients:
+        disconnect_client(client_id)
+    return jsonify({'ok': True})
+
 
 # ── Static page routes ────────────────────────────────────────────────────────
 PAGES = [
     'games', 'x', '2048', 'snake', 'tetris', 'chess', 'drawing',
-    'wordgame', 'cam', 'pong', 'battleship', 'trivia', 'bomberman',
+    'wordgame', 'pong', 'battleship', 'trivia', 'bomberman',
     'minesweeper', 'flapty', 'neonrun',
 ]
 
 @app.route('/')
 def index():
     return send_from_directory(WWW, 'index.html')
+
+@app.route('/http-socket.js')
+def http_socket_js():
+    return send_from_directory(WWW, 'http-socket.js')
+
+@app.route('/multiplayer-common.js')
+def multiplayer_common_js():
+    return send_from_directory(WWW, 'multiplayer-common.js')
+
+@app.route('/favicon.ico')
+def favicon():
+    return ('', 204)
 
 @app.route('/<page>/')
 @app.route('/<page>')
@@ -44,8 +146,7 @@ def game_page(page):
 
 # ── Global state ──────────────────────────────────────────────────────────────
 rooms      = {}          # roomId -> room dict
-clients    = {}          # ws -> info dict
-global_online = 0
+clients    = {}          # client_id -> info dict
 leaderboard   = []
 _glock = threading.Lock()   # guards rooms / clients / leaderboard / global_online
 
@@ -99,16 +200,23 @@ TRIVIA_QUESTIONS = [
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def ws_send(ws, data):
-    try:
-        ws.send(json.dumps(data))
-    except Exception:
-        pass
+def ws_send(client_id, data):
+    info = clients.get(client_id)
+    if not info or not info.get('alive', True):
+        return
+    payload = json.dumps(data)
+    cond = info.get('cond')
+    if cond is None:
+        return
+    with cond:
+        info['queue'].append(payload)
+        cond.notify_all()
+
 
 def broadcast(room, data, exclude=None):
-    for ws in list(room['clients']):
-        if ws is not exclude:
-            ws_send(ws, data)
+    for client_id in list(room['clients']):
+        if client_id != exclude:
+            ws_send(client_id, data)
 
 def broadcast_all(room, data):
     broadcast(room, data)
@@ -123,17 +231,17 @@ def shuffle(lst):
 
 def get_room_stats():
     stats = {g: 0 for g in ['drawing','wordgame','chess','pong','battleship','trivia','bomberman']}
-    stats['total'] = global_online
+    stats['total'] = sum(1 for info in clients.values() if info.get('alive'))
     for r in rooms.values():
         g = r['game']
         if g in stats:
-            stats[g] += len(r['clients'])
+            stats[g] += len([cid for cid in r['clients'] if clients.get(cid, {}).get('alive')])
     return stats
 
 def broadcast_stats():
     data = {'type': 'stats', **get_room_stats()}
-    for ws in list(clients):
-        ws_send(ws, data)
+    for client_id in list(clients):
+        ws_send(client_id, data)
 
 def add_leaderboard(name, game, score):
     with _glock:
@@ -144,13 +252,17 @@ def add_leaderboard(name, game, score):
 
 def broadcast_leaderboard():
     data = {'type': 'leaderboard', 'scores': leaderboard[:10]}
-    for ws in list(clients):
-        ws_send(ws, data)
+    for client_id in list(clients):
+        ws_send(client_id, data)
 
 def get_player_list(room):
+    drawer = None
+    if room.get('game') == 'drawing' and room.get('players') and room.get('game_running'):
+        drawer = room['players'][room['drawer_index'] % len(room['players'])]['name']
     return [
         {'name': p['name'], 'score': p['score'], 'lives': p['lives'],
-         'eliminated': p['eliminated'], 'active': False}
+         'eliminated': p['eliminated'], 'active': False,
+         'drawing': p['name'] == drawer}
         for p in room['players']
     ]
 
@@ -161,10 +273,21 @@ def cancel_timer(room, key):
         except Exception: pass
         room[key] = None
 
+@lru_cache(maxsize=20000)
+def is_valid_wordbomb_word(word):
+    w = (word or '').strip().lower()
+    if not w or not w.isalpha() or len(w) < 3:
+        return False
+    if zipf_frequency is None:
+        return False
+    # Require the word to have at least some real usage in English.
+    # This blocks obvious nonsense while keeping normal common words playable.
+    return zipf_frequency(w, 'en') >= 1.5
+
 # ── Room management ───────────────────────────────────────────────────────────
-def create_room(room_id, game):
+def create_room(room_key, game, public_room_id=None):
     return {
-        'id': room_id, 'game': game,
+        'id': public_room_id or room_key, 'key': room_key, 'game': game,
         'clients': set(), 'players': [], 'host': None,
         'game_running': False, 'round': 0,
         'drawer_index': 0, 'current_word': None,
@@ -183,22 +306,22 @@ def create_room(room_id, game):
         'bomb_next_id': 0, 'bomb_stop': None,
     }
 
-def join_room(ws, room_id, name, game):
-    global global_online
-    info = clients.get(ws, {})
+def join_room(client_id, room_id, name, game):
+    info = clients.get(client_id, {})
     if info.get('room'):
-        leave_room(ws)
+        leave_room(client_id)
 
+    room_key = f'{game}:{room_id}'
     with _glock:
-        if room_id not in rooms:
-            rooms[room_id] = create_room(room_id, game)
-        room = rooms[room_id]
+        if room_key not in rooms:
+            rooms[room_key] = create_room(room_key, game, room_id)
+        room = rooms[room_key]
 
     player_name = name or f'Player{random.randint(1,999)}'
-    clients[ws] = {'name': player_name, 'room': room_id, 'game': game}
+    clients[client_id].update({'name': player_name, 'room': room_key, 'game': game})
 
     player = {
-        'name': player_name, 'ws': ws,
+        'name': player_name, 'client_id': client_id,
         'score': 0, 'lives': 3, 'eliminated': False,
         '_side': None, '_ready': False, '_chess_color': None,
         'bs_ships': [], 'bs_grid': [], 'bs_ready': False, 'bs_sunk': 0,
@@ -207,7 +330,7 @@ def join_room(ws, room_id, name, game):
         'bomb_max': 1, 'bomb_count': 0, 'alive': True, 'color': None,
         'guessed': False,
     }
-    room['clients'].add(ws)
+    room['clients'].add(client_id)
     room['players'].append(player)
 
     player_list = get_player_list(room)
@@ -215,37 +338,37 @@ def join_room(ws, room_id, name, game):
     if game == 'pong':
         side = 'left' if len(room['players']) <= 1 else 'right'
         player['_side'] = side
-        ws_send(ws, {'type': 'joined', 'side': side, 'players': player_list})
-        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list}, ws)
+        ws_send(client_id, {'type': 'joined', 'side': side, 'players': player_list})
+        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list}, client_id)
         if len(room['players']) == 2:
             broadcast_all(room, {'type': 'pong_waiting', 'message': 'Both players connected! Press Ready.'})
         else:
-            ws_send(ws, {'type': 'pong_waiting', 'message': 'Waiting for opponent...'})
+            ws_send(client_id, {'type': 'pong_waiting', 'message': 'Waiting for opponent...'})
 
     elif game == 'chess':
         color = 'w' if len(room['players']) <= 1 else 'b'
         player['_chess_color'] = color
-        ws_send(ws, {'type': 'joined', 'color': color, 'players': player_list})
+        ws_send(client_id, {'type': 'joined', 'color': color, 'players': player_list})
         if len(room['players']) == 2:
             broadcast_all(room, {'type': 'game_start', 'message': 'Game started!'})
 
     elif game == 'battleship':
         is_host = len(room['players']) == 1
         if is_host:
-            room['host'] = ws
-        ws_send(ws, {'type': 'joined', 'players': player_list, 'isHost': is_host})
-        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list}, ws)
+            room['host'] = client_id
+        ws_send(client_id, {'type': 'joined', 'players': player_list, 'isHost': is_host})
+        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list}, client_id)
         if len(room['players']) == 2:
             broadcast_all(room, {'type': 'bs_start_placing'})
 
     else:
         is_host = len(room['players']) == 1
         if is_host:
-            room['host'] = ws
-        ws_send(ws, {'type': 'joined', 'players': player_list, 'isHost': is_host})
-        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list, 'isHost': is_host}, ws)
+            room['host'] = client_id
+        ws_send(client_id, {'type': 'joined', 'players': player_list, 'isHost': is_host})
+        broadcast(room, {'type': 'player_joined', 'name': player_name, 'players': player_list, 'isHost': is_host}, client_id)
         if room['game_running']:
-            ws_send(ws, {'type': 'waiting', 'message': 'Game in progress, wait for next round.', 'canStart': False})
+            ws_send(client_id, {'type': 'waiting', 'message': 'Game in progress, wait for next round.', 'canStart': False})
         else:
             broadcast_all(room, {
                 'type': 'waiting',
@@ -253,8 +376,8 @@ def join_room(ws, room_id, name, game):
                 'canStart': is_host or len(room['players']) >= 2
             })
 
-def leave_room(ws):
-    info = clients.get(ws, {})
+def leave_room(client_id):
+    info = clients.get(client_id, {})
     room_id = info.get('room')
     if not room_id:
         return
@@ -262,10 +385,10 @@ def leave_room(ws):
         room = rooms.get(room_id)
         if not room:
             return
-        room['clients'].discard(ws)
-        room['players'] = [p for p in room['players'] if p['ws'] is not ws]
-        if room['host'] is ws and room['players']:
-            room['host'] = room['players'][0]['ws']
+        room['clients'].discard(client_id)
+        room['players'] = [p for p in room['players'] if p['client_id'] != client_id]
+        if room['host'] == client_id and room['players']:
+            room['host'] = room['players'][0]['client_id']
 
     player_list = get_player_list(room)
     broadcast_all(room, {'type': 'player_left', 'name': info.get('name'), 'players': player_list})
@@ -287,49 +410,24 @@ def leave_room(ws):
         elif room['game'] == 'chess':
             broadcast_all(room, {'type': 'opponent_left'})
 
-    clients[ws] = {'name': None, 'room': None, 'game': None}
+    if client_id in clients:
+        clients[client_id].update({'name': None, 'room': None, 'game': None})
 
-# ── WebSocket handler ─────────────────────────────────────────────────────────
-@sock.route('/ws')
-def websocket(ws):
-    global global_online
-    with _glock:
-        global_online += 1
-        clients[ws] = {'name': None, 'room': None, 'game': None}
-
-    try:
-        while True:
-            raw = ws.receive()
-            if raw is None:
-                break
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            handle_message(ws, msg)
-    except Exception:
-        pass
-    finally:
-        with _glock:
-            global_online -= 1
-        leave_room(ws)
-        clients.pop(ws, None)
-        broadcast_stats()
-
-def handle_message(ws, msg):
+# ── HTTP socket message handling ──────────────────────────────────────────────
+def handle_message(client_id, msg):
     t = msg.get('type')
 
     if t == 'get_stats':
-        ws_send(ws, {'type': 'stats', **get_room_stats()})
-        ws_send(ws, {'type': 'leaderboard', 'scores': leaderboard[:10]})
+        ws_send(client_id, {'type': 'stats', **get_room_stats()})
+        ws_send(client_id, {'type': 'leaderboard', 'scores': leaderboard[:10]})
         return
 
     if t == 'join':
-        join_room(ws, msg.get('room', 'default'), msg.get('name'), msg.get('game', 'drawing'))
+        join_room(client_id, msg.get('room', 'default'), msg.get('name'), msg.get('game', 'drawing'))
         broadcast_stats()
         return
 
-    info = clients.get(ws, {})
+    info = clients.get(client_id, {})
     room_id = info.get('room')
     if not room_id:
         return
@@ -338,15 +436,15 @@ def handle_message(ws, msg):
         return
 
     game = room['game']
-    if   game == 'drawing':    handle_drawing_msg(ws, room, msg)
-    elif game == 'wordgame':   handle_word_msg(ws, room, msg)
-    elif game == 'chess':      handle_chess_msg(ws, room, msg)
-    elif game == 'pong':       handle_pong_msg(ws, room, msg)
-    elif game == 'battleship': handle_battleship_msg(ws, room, msg)
-    elif game == 'trivia':     handle_trivia_msg(ws, room, msg)
-    elif game == 'bomberman':  handle_bomberman_msg(ws, room, msg)
+    if   game == 'drawing':    handle_drawing_msg(client_id, room, msg)
+    elif game == 'wordgame':   handle_word_msg(client_id, room, msg)
+    elif game == 'chess':      handle_chess_msg(client_id, room, msg)
+    elif game == 'pong':       handle_pong_msg(client_id, room, msg)
+    elif game == 'battleship': handle_battleship_msg(client_id, room, msg)
+    elif game == 'trivia':     handle_trivia_msg(client_id, room, msg)
+    elif game == 'bomberman':  handle_bomberman_msg(client_id, room, msg)
 
-    if t == 'start_game' and room['host'] is ws:
+    if t == 'start_game' and room['host'] == client_id:
         if   game == 'drawing':   start_drawing_game(room)
         elif game == 'wordgame':  start_word_game(room)
         elif game == 'trivia':    start_trivia(room)
@@ -354,6 +452,9 @@ def handle_message(ws, msg):
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
 def start_drawing_game(room):
+    if len(room['players']) < 2:
+        broadcast_all(room, {'type': 'waiting', 'message': 'Need at least 2 players!', 'canStart': True})
+        return
     room['game_running'] = True
     room['round'] = 0
     for p in room['players']:
@@ -377,7 +478,7 @@ def next_drawing_round(room):
 
     for p in room['players']:
         is_drawer = p['name'] == drawer['name']
-        ws_send(p['ws'], {
+        ws_send(p['client_id'], {
             'type': 'round_start', 'round': room['round'], 'totalRounds': total,
             'drawer': drawer['name'], 'word': room['current_word'] if is_drawer else hint,
             'hint': hint, 'timeLeft': 60, 'players': get_player_list(room)
@@ -417,21 +518,21 @@ def end_drawing_game(room):
     if winner:
         add_leaderboard(winner['name'], 'Drawing', winner['score'])
 
-def handle_drawing_msg(ws, room, msg):
+def handle_drawing_msg(client_id, room, msg):
     t = msg.get('type')
-    info = clients.get(ws, {})
+    info = clients.get(client_id, {})
     drawer_idx = room['drawer_index'] % len(room['players']) if room['players'] else 0
     drawer = room['players'][drawer_idx] if room['players'] else None
 
     if t == 'draw' and drawer and info.get('name') == drawer['name']:
         broadcast(room, {'type': 'draw', 'action': msg.get('action'), 'x': msg.get('x'),
-                         'y': msg.get('y'), 'color': msg.get('color'), 'size': msg.get('size')}, ws)
+                         'y': msg.get('y'), 'color': msg.get('color'), 'size': msg.get('size')}, client_id)
     if t == 'draw_clear' and drawer and info.get('name') == drawer['name']:
-        broadcast(room, {'type': 'draw_clear'}, ws)
+        broadcast(room, {'type': 'draw_clear'}, client_id)
     if t == 'guess':
         word = (msg.get('word') or '').lower().strip()
         player = next((p for p in room['players'] if p['name'] == info.get('name')), None)
-        if not player or player['guessed']:
+        if not player or player['guessed'] or (drawer and player['name'] == drawer['name']):
             return
         correct = room['game_running'] and word == (room['current_word'] or '').lower()
         if correct:
@@ -459,7 +560,8 @@ def start_word_game(room):
         p['score'] = 0
         p['lives'] = 3
         p['eliminated'] = False
-    room['current_player_index'] = 0
+    room['round'] = 0
+    room['current_player_index'] = -1
     broadcast_all(room, {'type': 'game_start'})
     next_word_turn(room)
 
@@ -508,16 +610,17 @@ def end_word_game(room):
     if winner:
         add_leaderboard(winner['name'], 'Word Bomb', winner['score'])
 
-def handle_word_msg(ws, room, msg):
+def handle_word_msg(client_id, room, msg):
     if msg.get('type') != 'word':
         return
-    info = clients.get(ws, {})
+    info = clients.get(client_id, {})
     current = room['players'][room['current_player_index']] if room['players'] else None
     if not current or current['name'] != info.get('name'):
         return
-    word = (msg.get('word') or '').upper().strip()
+    raw_word = (msg.get('word') or '').strip()
+    word = raw_word.upper()
     syllable = room.get('syllable', '')
-    valid = syllable in word and len(word) >= 3 and word.isalpha()
+    valid = syllable in word and len(word) >= 3 and word.isalpha() and is_valid_wordbomb_word(raw_word)
     cancel_timer(room, 'word_timer')
     if valid:
         points = len(word) * 5
@@ -547,10 +650,10 @@ def handle_word_msg(ws, room, msg):
         t.start()
 
 # ── Chess ─────────────────────────────────────────────────────────────────────
-def handle_chess_msg(ws, room, msg):
+def handle_chess_msg(client_id, room, msg):
     if msg.get('type') == 'chess_move':
         broadcast(room, {'type': 'chess_move', 'from': msg.get('from'), 'to': msg.get('to'),
-                         'promotion': msg.get('promotion'), 'fen': msg.get('fen')}, ws)
+                         'promotion': msg.get('promotion'), 'fen': msg.get('fen')}, client_id)
 
 # ── Pong ──────────────────────────────────────────────────────────────────────
 PONG_W, PONG_H = 800, 400
@@ -660,8 +763,8 @@ def end_pong(room, side):
     broadcast_all(room, {'type': 'pong_over', 'winner': winner, 'scores': ps['scores']})
     add_leaderboard(winner, 'Pong', ps['scores'][side] * 100)
 
-def handle_pong_msg(ws, room, msg):
-    player = next((p for p in room['players'] if p['ws'] is ws), None)
+def handle_pong_msg(client_id, room, msg):
+    player = next((p for p in room['players'] if p['client_id'] == client_id), None)
     if not player:
         return
     t = msg.get('type')
@@ -679,8 +782,8 @@ def handle_pong_msg(ws, room, msg):
             start_pong_loop(room)
 
 # ── Battleship ────────────────────────────────────────────────────────────────
-def handle_battleship_msg(ws, room, msg):
-    player = next((p for p in room['players'] if p['ws'] is ws), None)
+def handle_battleship_msg(client_id, room, msg):
+    player = next((p for p in room['players'] if p['client_id'] == client_id), None)
     if not player:
         return
     t = msg.get('type')
@@ -700,9 +803,9 @@ def handle_battleship_msg(ws, room, msg):
         if both_ready:
             room['bs_turn'] = 0
             for i, p in enumerate(room['players']):
-                ws_send(p['ws'], {'type': 'bs_battle_start', 'yourTurn': i == 0})
+                ws_send(p['client_id'], {'type': 'bs_battle_start', 'yourTurn': i == 0})
         else:
-            ws_send(ws, {'type': 'bs_wait_opponent'})
+            ws_send(client_id, {'type': 'bs_wait_opponent'})
 
     if t == 'bs_fire':
         attacker_idx = room['players'].index(player)
@@ -711,6 +814,9 @@ def handle_battleship_msg(ws, room, msg):
         defender = room['players'][1 - attacker_idx]
         row, col = msg.get('row', 0), msg.get('col', 0)
         if not (0 <= row < 10 and 0 <= col < 10):
+            return
+
+        if defender['bs_grid'][row][col] in (2, 3):
             return
 
         hit = defender['bs_grid'][row][col] == 1
@@ -726,16 +832,17 @@ def handle_battleship_msg(ws, room, msg):
                         defender['bs_sunk'] += 1
                     break
 
-        ws_send(ws, {'type': 'bs_result', 'row': row, 'col': col, 'hit': hit,
-                     'sunk': bool(sunk_cells), 'sunkCells': sunk_cells})
-        ws_send(defender['ws'], {'type': 'bs_incoming', 'row': row, 'col': col, 'hit': hit,
-                                  'sunk': bool(sunk_cells), 'sunkCells': sunk_cells})
+        same_turn = bool(hit)
+        ws_send(client_id, {'type': 'bs_result', 'row': row, 'col': col, 'hit': hit,
+                     'sunk': bool(sunk_cells), 'sunkCells': sunk_cells, 'yourTurn': same_turn})
+        ws_send(defender['client_id'], {'type': 'bs_incoming', 'row': row, 'col': col, 'hit': hit,
+                                  'sunk': bool(sunk_cells), 'sunkCells': sunk_cells, 'yourTurn': not same_turn})
 
         if defender['bs_sunk'] >= len(defender['bs_ships']):
             broadcast_all(room, {'type': 'bs_over', 'winner': player['name']})
             add_leaderboard(player['name'], 'Battleship', 1000)
         else:
-            room['bs_turn'] = 1 - attacker_idx
+            room['bs_turn'] = attacker_idx if hit else (1 - attacker_idx)
 
 # ── Trivia ────────────────────────────────────────────────────────────────────
 def start_trivia(room):
@@ -800,10 +907,10 @@ def end_trivia(room):
     if winner:
         add_leaderboard(winner['name'], 'Trivia', winner['score'])
 
-def handle_trivia_msg(ws, room, msg):
+def handle_trivia_msg(client_id, room, msg):
     if msg.get('type') != 'trivia_answer':
         return
-    player = next((p for p in room['players'] if p['ws'] is ws), None)
+    player = next((p for p in room['players'] if p['client_id'] == client_id), None)
     if not player or player.get('trivia_answered'):
         return
     player['trivia_answered'] = True
@@ -814,7 +921,7 @@ def handle_trivia_msg(ws, room, msg):
     points = 100 + time_bonus if correct else 0
     player['score'] += points
     room['trivia_answers'][player['name']] = answer
-    ws_send(ws, {'type': 'trivia_ack', 'correct': correct, 'points': points})
+    ws_send(client_id, {'type': 'trivia_ack', 'correct': correct, 'points': points})
     if all(p.get('trivia_answered') for p in room['players']):
         cancel_timer(room, 'trivia_timer')
         t = threading.Timer(0.6, reveal_trivia_answer, args=[room])
@@ -977,8 +1084,8 @@ def end_bomberman(room, winner):
     if winner:
         add_leaderboard(winner['name'], 'Bomberman', 500 * len(room['players']))
 
-def handle_bomberman_msg(ws, room, msg):
-    player = next((p for p in room['players'] if p['ws'] is ws), None)
+def handle_bomberman_msg(client_id, room, msg):
+    player = next((p for p in room['players'] if p['client_id'] == client_id), None)
     if not player or not player.get('alive'):
         return
     t = msg.get('type')
@@ -1020,12 +1127,21 @@ def handle_bomberman_msg(ws, room, msg):
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 def cleanup_loop():
+    client_ttl = 45
     while True:
-        time.sleep(600)
+        time.sleep(10)
+        now = time.time()
+        stale_clients = []
         with _glock:
             dead = [rid for rid, r in rooms.items() if not r['clients']]
             for rid in dead:
                 del rooms[rid]
+            stale_clients = [
+                cid for cid, info in list(clients.items())
+                if info.get('alive') and now - info.get('last_seen', now) > client_ttl
+            ]
+        for cid in stale_clients:
+            disconnect_client(cid)
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
@@ -1033,4 +1149,4 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f'GameVault running on http://0.0.0.0:{port}')
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='127.0.0.1', port=port, debug=False, threaded=True)

@@ -12,8 +12,9 @@
 <script>
   const params = new URLSearchParams(window.location.search);
   const token = params.get('t');
+  const direct = params.get('dest');
   const map = JSON.parse(sessionStorage.getItem('gameTokenMap') || '{}');
-  const dest = token && map[token];
+  const dest = direct || (token && map[token]);
   if (dest) {
     window.location.replace(dest);
   } else {

@@ -1,26 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key = 'urlmask:' + location.pathname;
-  var token = sessionStorage.getItem(key);
-  if (!token) {
-    token = Math.random().toString(36).substr(2,10);
-    sessionStorage.setItem(key, token);
-  }
-  // Keep gameTokenMap updated so /x/ redirects work too
-  try {
-    var map = JSON.parse(sessionStorage.getItem('gameTokenMap') || '{}');
-    map[token] = location.pathname + location.search;
-    sessionStorage.setItem('gameTokenMap', JSON.stringify(map));
-  } catch(e) {}
-  // Only rewrite if not already on /x/
-  if (location.pathname !== '/x/') {
-    history.replaceState(null, '', '/x/?t=' + token);
-  }
-})();
-</script>
+<script src="/http-socket.js"></script>
+<script src="/multiplayer-common.js"></script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Drawing Party — GameVault</title>
@@ -71,6 +54,11 @@
   .btn{background:#7b2fff;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-family:'Orbitron',monospace;font-size:13px;font-weight:700;cursor:pointer;letter-spacing:1px;text-transform:uppercase;transition:opacity .2s;}
   .btn:hover{opacity:.85}
   @media(max-width:700px){.left-panel,.right-panel{display:none;} .word-bar{justify-content:center;}}
+
+  .ping-badge{font-family:'Orbitron',monospace;font-size:11px;color:rgba(224,240,255,0.55);border:1px solid rgba(255,255,255,0.12);padding:4px 8px;border-radius:999px;}
+  .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
+  .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
+  .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
 </style>
 </head>
 <body>
@@ -78,6 +66,7 @@
   <a class="back" href="/games">← Back</a>
   <h1>🎨 Drawing Party</h1>
   <div class="room-badge" id="room-badge">Room: ---</div>
+  <div class="ping-badge" id="ping-badge">Ping -- ms</div>
 </header>
 <div class="game-area">
   <div class="left-panel">
@@ -119,9 +108,7 @@
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const roomId = params.get('room') || Math.random().toString(36).substr(2,6).toUpperCase();
-const playerName = params.get('name') || localStorage.getItem('playerName') || 'Player';
+const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-badge').textContent = 'Room: ' + roomId;
 
 const canvas = document.getElementById('canvas');
@@ -259,6 +246,7 @@ function renderPlayers(players) {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  GameVaultMP.bindPingDisplay(ws, 'ping-badge');
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'drawing' }));
   };
@@ -266,22 +254,32 @@ function connect() {
     const d = JSON.parse(e.data);
     if (d.type === 'joined') {
       addMsg('', `Welcome, ${playerName}! Room: ${roomId}`, 'system');
-      document.getElementById('overlay').style.display = 'none';
       renderPlayers(d.players || []);
+      document.getElementById('overlay').style.display = 'flex';
+      document.getElementById('overlay').innerHTML = `
+        <h2>Drawing Party</h2>
+        <p style="color:rgba(224,240,255,0.6)">Room ${roomId} — waiting for players...</p>
+        ${d.isHost ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Start Game</button>` : ''}
+      `;
     }
     if (d.type === 'player_joined') { addMsg('', `${d.name} joined`, 'system'); renderPlayers(d.players); }
     if (d.type === 'player_left') { addMsg('', `${d.name} left`, 'system'); renderPlayers(d.players); }
     if (d.type === 'round_start') {
       isDrawer = d.drawer === playerName;
       document.getElementById('round-info').textContent = `Round ${d.round} of ${d.totalRounds}`;
+      document.getElementById('overlay').style.display = 'none';
       if (isDrawer) {
         document.getElementById('word-display').textContent = d.word;
         addMsg('', `You are drawing: ${d.word}`, 'system');
         document.getElementById('toolbar').style.display = 'flex';
+        document.getElementById('chat-input').placeholder = 'Others are guessing...';
+        document.getElementById('chat-input').disabled = true;
       } else {
         document.getElementById('word-display').textContent = d.hint;
         addMsg('', `${d.drawer} is drawing!`, 'system');
         document.getElementById('toolbar').style.display = 'none';
+        document.getElementById('chat-input').placeholder = 'Type guess...';
+        document.getElementById('chat-input').disabled = false;
       }
       initCanvas(); startTimer(d.timeLeft || 60);
       renderPlayers(d.players);
@@ -294,6 +292,8 @@ function connect() {
     if (d.type === 'guess_msg') { addMsg(d.name, d.word, d.correct ? 'correct' : ''); }
     if (d.type === 'round_end') {
       clearInterval(timerInterval);
+      document.getElementById('chat-input').disabled = true;
+      document.getElementById('chat-input').placeholder = 'Next round starting...';
       addMsg('', `Round over! The word was: ${d.word}`, 'system');
       renderPlayers(d.players);
     }

@@ -1,26 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key = 'urlmask:' + location.pathname;
-  var token = sessionStorage.getItem(key);
-  if (!token) {
-    token = Math.random().toString(36).substr(2,10);
-    sessionStorage.setItem(key, token);
-  }
-  // Keep gameTokenMap updated so /x/ redirects work too
-  try {
-    var map = JSON.parse(sessionStorage.getItem('gameTokenMap') || '{}');
-    map[token] = location.pathname + location.search;
-    sessionStorage.setItem('gameTokenMap', JSON.stringify(map));
-  } catch(e) {}
-  // Only rewrite if not already on /x/
-  if (location.pathname !== '/x/') {
-    history.replaceState(null, '', '/x/?t=' + token);
-  }
-})();
-</script>
+<script src="/http-socket.js"></script>
+<script src="/multiplayer-common.js"></script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Word Bomb — GameVault</title>
@@ -61,8 +44,14 @@
   .overlay{position:fixed;inset:0;background:rgba(5,7,15,0.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:50;}
   .overlay h2{font-family:'Orbitron',monospace;font-size:28px;color:#0088ff;letter-spacing:3px;}
   .overlay p{color:rgba(224,240,255,0.6);font-size:16px;}
+  .room-code{font-family:'Orbitron',monospace;font-size:18px;color:#00ffaa;letter-spacing:3px;padding:10px 14px;border:1px solid rgba(0,255,170,0.25);border-radius:10px;background:rgba(0,255,170,0.06);}
   .btn{background:#0088ff;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-family:'Orbitron',monospace;font-size:13px;font-weight:700;cursor:pointer;letter-spacing:1px;text-transform:uppercase;transition:opacity .2s;}
   .btn:hover{opacity:.85}
+
+  .ping-badge{font-family:'Orbitron',monospace;font-size:11px;color:rgba(224,240,255,0.55);border:1px solid rgba(255,255,255,0.12);padding:4px 8px;border-radius:999px;}
+  .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
+  .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
+  .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
 </style>
 </head>
 <body>
@@ -70,6 +59,7 @@
   <a class="back" href="/games">← Back</a>
   <h1>💣 Word Bomb</h1>
   <div class="room-badge" id="room-badge">Room: ---</div>
+  <div class="ping-badge" id="ping-badge">Ping -- ms</div>
 </header>
 <div class="main">
   <div class="players-ring" id="players-ring"></div>
@@ -87,17 +77,17 @@
 
 <div class="overlay" id="overlay">
   <h2>💣 Word Bomb</h2>
+  <div class="room-code" id="room-code">ROOM ---</div>
   <p id="overlay-msg">Connecting...</p>
   <button class="btn" id="start-btn" style="display:none" onclick="startGame()">Start Game</button>
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const roomId = params.get('room') || Math.random().toString(36).substr(2,6).toUpperCase();
-const playerName = params.get('name') || localStorage.getItem('playerName') || 'Player';
+const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-badge').textContent = 'Room: ' + roomId;
+document.getElementById('room-code').textContent = 'ROOM ' + roomId;
 
-let ws, isMyTurn = false, timerFillInterval;
+let ws, isMyTurn = false, timerFillInterval, isHost = false;
 
 function addLog(text, type='') {
   const log = document.getElementById('log');
@@ -153,39 +143,65 @@ wordInput.addEventListener('keydown', e => {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  GameVaultMP.bindPingDisplay(ws, 'ping-badge');
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'wordgame' }));
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.type === 'joined') {
+      isHost = !!d.isHost;
+      document.getElementById('overlay').style.display = 'flex';
       document.getElementById('overlay-msg').textContent = `Room ${roomId} — ${d.players.length} player(s). Need 2 to start.`;
-      document.getElementById('start-btn').style.display = d.isHost ? 'block' : 'none';
+      document.getElementById('start-btn').style.display = isHost ? 'block' : 'none';
       renderPlayers(d.players.map(p => ({...p, isMe: p.name === playerName})));
     }
     if (d.type === 'player_joined') {
       addLog(`${d.name} joined`, 'sys');
-      document.getElementById('overlay-msg').textContent = `Room ${roomId} — ${d.players.length} player(s).`;
-      document.getElementById('start-btn').style.display = d.isHost ? 'block' : 'none';
+      document.getElementById('overlay').style.display = 'flex';
+      document.getElementById('overlay-msg').textContent = `Room ${roomId} — ${d.players.length} player(s). ${d.players.length < 2 ? 'Need 2 to start.' : 'Ready to start.'}`;
+      document.getElementById('start-btn').style.display = isHost ? 'block' : 'none';
       renderPlayers(d.players.map(p => ({...p, isMe: p.name === playerName})));
+    }
+    if (d.type === 'player_left') {
+      addLog(`${d.name} left`, 'sys');
+      isMyTurn = false;
+      wordInput.disabled = true;
+      document.getElementById('overlay').style.display = 'flex';
+      document.getElementById('overlay-msg').textContent = `Room ${roomId} — ${d.players.length} player(s). ${d.players.length < 2 ? 'Need 2 to start.' : 'Ready to continue.'}`;
+      renderPlayers(d.players.map(p => ({...p, isMe: p.name === playerName})));
+    }
+    if (d.type === 'waiting') {
+      document.getElementById('overlay').style.display = 'flex';
+      document.getElementById('overlay-msg').textContent = d.message || 'Waiting for players...';
+      document.getElementById('start-btn').style.display = (isHost && d.canStart) ? 'block' : 'none';
     }
     if (d.type === 'game_start') {
       document.getElementById('overlay').style.display = 'none';
       addLog('Game started!', 'sys');
     }
     if (d.type === 'turn') {
+      document.getElementById('overlay').style.display = 'none';
       isMyTurn = d.player === playerName;
       setSyllable(d.syllable);
       renderPlayers(d.players.map(p => ({...p, active: p.name === d.player, isMe: p.name === playerName})));
       startTimer(d.timeLeft);
       wordInput.disabled = !isMyTurn;
+      wordInput.value = '';
       if (isMyTurn) { wordInput.focus(); wordInput.placeholder = `Type a word with "${d.syllable}"...`; }
       else { wordInput.placeholder = `${d.player}'s turn...`; }
     }
     if (d.type === 'word_result') {
+      isMyTurn = false;
+      wordInput.disabled = true;
       if (d.valid) {
         addLog(`✓ ${d.player}: ${d.word} (+${d.points})`, 'success');
-        if (d.player === playerName) { wordInput.classList.add('correct'); setTimeout(() => wordInput.classList.remove('correct'), 300); }
+        if (d.player === playerName) {
+          wordInput.classList.add('correct');
+          setTimeout(() => wordInput.classList.remove('correct'), 300);
+        }
       } else {
         addLog(`✗ ${d.player}: ${d.word || '(timeout)'}`, 'fail');
+        wordInput.classList.add('wrong');
+        setTimeout(() => wordInput.classList.remove('wrong'), 300);
         document.getElementById('bomb').classList.add('shake');
         setTimeout(() => document.getElementById('bomb').classList.remove('shake'), 300);
       }
@@ -198,6 +214,7 @@ function connect() {
       document.getElementById('overlay').style.display = 'flex';
       document.getElementById('overlay').innerHTML = `
         <h2>💣 Game Over!</h2>
+        <div class="room-code">ROOM ${roomId}</div>
         <p style="color:rgba(224,240,255,0.6)">Winner: <strong>${d.winner}</strong></p>
         <button class="btn" onclick="location.reload()">Play Again</button>
         <a href="/games" style="color:rgba(224,240,255,0.4);font-size:13px;margin-top:8px">Back to portal</a>

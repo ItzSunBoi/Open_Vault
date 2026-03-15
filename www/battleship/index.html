@@ -1,15 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key = 'urlmask:' + location.pathname;
-  var token = sessionStorage.getItem(key);
-  if (!token) { token = Math.random().toString(36).substr(2,10); sessionStorage.setItem(key, token); }
-  try { var map = JSON.parse(sessionStorage.getItem('gameTokenMap')||'{}'); map[token]=location.pathname+location.search; sessionStorage.setItem('gameTokenMap',JSON.stringify(map)); } catch(e) {}
-  if (location.pathname !== '/x/') history.replaceState(null,'','/x/?t='+token);
-})();
-</script>
+<script src="/http-socket.js"></script>
+<script src="/multiplayer-common.js"></script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Battleship — GameVault</title>
@@ -32,7 +26,8 @@ main { display:flex;flex-direction:column;align-items:center;padding:12px;gap:12
 .board-label { font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;
   color:rgba(0,180,255,0.5);text-transform:uppercase; }
 .grid { display:grid;grid-template-columns:repeat(10,1fr);gap:2px;cursor:pointer; }
-.grid.no-click { cursor:default; }
+.grid.no-click { cursor:default; opacity:0.96; }
+.grid.placing-grid { box-shadow:0 0 0 1px rgba(0,180,255,0.22), 0 0 18px rgba(0,180,255,0.12); }
 .cell { width:28px;height:28px;border-radius:3px;background:#0a1520;
   border:1px solid rgba(0,180,255,0.12);transition:all .12s;display:flex;align-items:center;justify-content:center;font-size:13px; }
 .cell.ship   { background:#0d2a3a;border-color:rgba(0,180,255,0.35); }
@@ -61,6 +56,11 @@ main { display:flex;flex-direction:column;align-items:center;padding:12px;gap:12
 .overlay h2 { font-family:'Orbitron',monospace;font-size:30px;letter-spacing:4px;color:#00b4ff; }
 .overlay p  { color:rgba(224,240,255,0.55);font-size:15px;text-align:center;max-width:340px; }
 @media(max-width:480px) { .cell{width:22px;height:22px;font-size:10px;} }
+
+  .ping-badge{font-family:'Orbitron',monospace;font-size:11px;color:rgba(224,240,255,0.55);border:1px solid rgba(255,255,255,0.12);padding:4px 8px;border-radius:999px;}
+  .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
+  .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
+  .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
 </style>
 </head>
 <body>
@@ -68,6 +68,7 @@ main { display:flex;flex-direction:column;align-items:center;padding:12px;gap:12
   <a class="back" href="/games">← Back</a>
   <h1>BATTLESHIP</h1>
   <div class="room-tag" id="room-tag"></div>
+  <div class="ping-badge" id="ping-badge">Ping -- ms</div>
 </header>
 <main>
   <div class="status-bar" id="status">Connecting...</div>
@@ -91,9 +92,7 @@ main { display:flex;flex-direction:column;align-items:center;padding:12px;gap:12
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const roomId = params.get('room') || 'BS01';
-const myName = decodeURIComponent(params.get('name') || 'Admiral');
+const { roomId, playerName: myName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Admiral' });
 document.getElementById('room-tag').textContent = 'ROOM: ' + roomId;
 
 const SHIPS = [
@@ -113,10 +112,13 @@ let horizontal = true;
 let myTurn = false;
 let phase = 'waiting'; // waiting | placing | battle | done
 let hoveredCells = [];
+let lastHoverKey = '';
+let pendingShot = false;
 
 // ── WS ────────────────────────────────────────────────────────────────────────
 const wsProto = location.protocol==='https:'?'wss':'ws';
 const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
+GameVaultMP.bindPingDisplay(ws, 'ping-badge');
 ws.onopen = () => ws.send(JSON.stringify({type:'join',room:roomId,name:myName,game:'battleship'}));
 ws.onmessage = e => handleMsg(JSON.parse(e.data));
 ws.onclose   = () => setStatus('Disconnected. Please refresh.');
@@ -126,11 +128,12 @@ function send(obj) { if(ws.readyState===1) ws.send(JSON.stringify(obj)); }
 function handleMsg(msg) {
   switch(msg.type) {
     case 'joined':
-      setStatus('Waiting for opponent...');
+      setStatus(msg.isHost ? 'Waiting for opponent to join this room...' : 'Joined room. Waiting for host...');
       break;
     case 'bs_start_placing':
       phase = 'placing';
-      setStatus('Place your ships! Click a ship then click the grid. R to rotate.');
+      selectedShip = SHIPS.find(s => !placedShips.some(p => p.name === s.name)) || null;
+      setStatus('Place your ships! Tap a ship, then tap your grid. Press R to rotate on desktop.');
       renderShipsBar();
       renderButtons();
       renderMyGrid();
@@ -147,18 +150,26 @@ function handleMsg(msg) {
       renderEnemyGrid();
       break;
     case 'bs_result':
+      pendingShot = false;
       enemyGrid[msg.row][msg.col] = msg.hit ? 2 : 3;
       if (msg.sunk) markSunk(enemyGrid, msg.sunkCells, true);
+      myTurn = !!msg.yourTurn;
       renderEnemyGrid();
-      myTurn = false;
-      setStatus(msg.hit ? (msg.sunk?'💥 SUNK!':'HIT! Opponent\'s turn...') : 'Miss! Opponent\'s turn...');
+      renderMyGrid();
+      setStatus(msg.hit
+        ? (msg.sunk ? '💥 SUNK! Hit again.' : 'HIT! Fire again.')
+        : 'Miss! Opponent\'s turn...');
       break;
     case 'bs_incoming':
+      pendingShot = false;
       myGrid[msg.row][msg.col] = msg.hit ? 2 : 3;
       if (msg.sunk) markSunk(myGrid, msg.sunkCells, false);
+      myTurn = !!msg.yourTurn;
       renderMyGrid();
-      myTurn = true;
-      setStatus(msg.hit ? (msg.sunk?'Your ship was SUNK! Your turn...':'Your ship was HIT! Your turn...') : 'They missed! Your turn — Fire!');
+      renderEnemyGrid();
+      setStatus(msg.hit
+        ? (msg.sunk ? 'Your ship was SUNK! Opponent fires again.' : 'Your ship was HIT! Opponent fires again.')
+        : 'They missed! Your turn — Fire!');
       break;
     case 'bs_over':
       phase = 'done';
@@ -183,12 +194,21 @@ function markSunk(grid, cells, isEnemy) {
 function renderShipsBar() {
   const bar = document.getElementById('ships-bar');
   bar.innerHTML = '';
+  const firstAvailable = SHIPS.find(s => !placedShips.some(p => p.name === s.name));
+  if (!selectedShip && firstAvailable && phase === 'placing') selectedShip = firstAvailable;
   SHIPS.forEach((s,i) => {
     const placed = placedShips.some(p=>p.name===s.name);
     const btn = document.createElement('button');
     btn.className = 'ship-btn' + (placed?' placed':'') + (selectedShip&&selectedShip.name===s.name?' selected':'');
     btn.textContent = s.name + ' (' + s.size + ')';
-    btn.onclick = () => { if(!placed){selectedShip=s; renderShipsBar();} };
+    btn.onclick = () => {
+      if(!placed){
+        selectedShip = s;
+        setStatus(`Placing ${s.name} (${s.size}). ${horizontal ? 'Horizontal' : 'Vertical'} orientation.`);
+        renderShipsBar();
+        renderMyGrid();
+      }
+    };
     bar.appendChild(btn);
   });
 }
@@ -223,6 +243,8 @@ function resetPlacement() {
   myGrid = Array.from({length:ROWS},()=>Array(COLS).fill(0));
   placedShips = [];
   selectedShip = null;
+  hoveredCells = [];
+  lastHoverKey = '';
   renderShipsBar();
   renderButtons();
   renderMyGrid();
@@ -247,50 +269,85 @@ function getHoverCells(row,col) {
   return cells;
 }
 
+function setHoverCells(cells) {
+  const normalized = cells || [];
+  const key = normalized.map(([r,c]) => `${r},${c}`).join('|');
+  if (key === lastHoverKey) return;
+  hoveredCells = normalized;
+  lastHoverKey = key;
+  renderMyGrid();
+}
+
 function placeShip(row,col) {
   if(!selectedShip||phase!=='placing') return;
   if(placedShips.some(p=>p.name===selectedShip.name)) return;
   const cells = getHoverCells(row,col);
-  if(!cells) return;
-  // Check overlap
-  for(const [r,c] of cells) if(myGrid[r][c]===1) return;
+  if(!cells) {
+    setStatus('That ship does not fit there. Try another square or rotate it.');
+    return;
+  }
+  for(const [r,c] of cells) {
+    if(myGrid[r][c]===1) {
+      setStatus('Ships cannot overlap. Pick another position.');
+      return;
+    }
+  }
   cells.forEach(([r,c])=>myGrid[r][c]=1);
   placedShips.push({name:selectedShip.name,size:selectedShip.size,cells});
+  const placedName = selectedShip.name;
   selectedShip=null;
+  hoveredCells=[];
+  lastHoverKey='';
   renderShipsBar();
   renderButtons();
   renderMyGrid();
+  const remaining = SHIPS.filter(s => !placedShips.some(p => p.name === s.name)).length;
+  setStatus(remaining ? `${placedName} placed. Select the next ship.` : 'All ships placed. Hit Ready!');
 }
 
 // ── Grids ─────────────────────────────────────────────────────────────────────
 function renderMyGrid() {
   const grid = document.getElementById('my-grid');
-  grid.innerHTML='';
-  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++) {
-    const cell=document.createElement('div');
-    cell.className='cell';
+  grid.className='grid' + (phase==='placing' ? ' placing-grid' : ' no-click');
+
+  const needsRebuild = grid.children.length !== ROWS * COLS;
+  if (needsRebuild) {
+    grid.innerHTML='';
+    for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++) {
+      const cell=document.createElement('div');
+      cell.className='cell';
+      cell.dataset.row = r;
+      cell.dataset.col = c;
+      grid.appendChild(cell);
+    }
+  }
+
+  const cells=[...grid.querySelectorAll('.cell')];
+  cells.forEach((cell,idx)=>{
+    const r = Number(cell.dataset.row ?? Math.floor(idx / COLS));
+    const c = Number(cell.dataset.col ?? idx % COLS);
+    cell.className = 'cell';
+    cell.textContent = '';
     const v=myGrid[r][c];
     if(v===1) { cell.classList.add('ship'); }
     else if(v===2) { cell.classList.add('hit'); cell.textContent='💥'; }
     else if(v===3) { cell.classList.add('miss'); cell.textContent='•'; }
     else if(v===4) { cell.classList.add('sunk'); cell.textContent='☠'; }
-    // Show hover preview
     if(phase==='placing'&&selectedShip) {
       const inHover = hoveredCells.some(([hr,hc])=>hr===r&&hc===c);
       if(inHover) cell.classList.add('placing');
     }
-    grid.appendChild(cell);
-  }
-  // Hover events on my grid for placement
-  if(phase==='placing') {
-    const cells=[...grid.querySelectorAll('.cell')];
-    cells.forEach((cell,idx)=>{
-      const r=Math.floor(idx/COLS), c=idx%COLS;
-      cell.addEventListener('mouseenter',()=>{ hoveredCells=getHoverCells(r,c)||[]; renderMyGrid(); });
-      cell.addEventListener('mouseleave',()=>{ hoveredCells=[]; renderMyGrid(); });
+
+    if (phase==='placing' && !cell.dataset.boundPlacement) {
+      cell.dataset.boundPlacement = '1';
+      cell.addEventListener('mouseenter',()=>setHoverCells(getHoverCells(r,c)||[]));
+      cell.addEventListener('mouseleave',()=>setHoverCells([]));
       cell.addEventListener('click',()=>placeShip(r,c));
-    });
-  }
+      cell.addEventListener('touchstart',(e)=>{ e.preventDefault(); hoveredCells = getHoverCells(r,c) || []; }, {passive:false});
+      cell.addEventListener('touchend',(e)=>{ e.preventDefault(); placeShip(r,c); }, {passive:false});
+      cell.addEventListener('pointerup',(e)=>{ if(e.pointerType !== 'mouse') placeShip(r,c); });
+    }
+  });
 }
 
 function renderEnemyGrid() {
@@ -308,13 +365,17 @@ function renderEnemyGrid() {
       cell.addEventListener('mouseenter',()=>cell.classList.add('hover'));
       cell.addEventListener('mouseleave',()=>cell.classList.remove('hover'));
       cell.addEventListener('click',()=>fireAt(r,c));
+      cell.addEventListener('touchstart',(e)=>{ e.preventDefault(); cell.classList.add('hover'); }, {passive:false});
+      cell.addEventListener('touchend',(e)=>{ e.preventDefault(); fireAt(r,c); }, {passive:false});
+      cell.addEventListener('pointerup',(e)=>{ if(e.pointerType !== 'mouse') fireAt(r,c); });
     }
     grid.appendChild(cell);
   }
 }
 
 function fireAt(r,c) {
-  if(!myTurn||enemyGrid[r][c]!==0||phase!=='battle') return;
+  if(!myTurn||enemyGrid[r][c]!==0||phase!=='battle'||pendingShot) return;
+  pendingShot = true;
   myTurn=false;
   setStatus('Firing...');
   renderEnemyGrid();
@@ -326,7 +387,7 @@ function setStatus(txt) {
 }
 
 // keyboard rotate
-document.addEventListener('keydown',e=>{ if(e.key==='r'||e.key==='R'){horizontal=!horizontal;renderButtons();renderMyGrid();} });
+document.addEventListener('keydown',e=>{ if(e.key==='r'||e.key==='R'){horizontal=!horizontal;setStatus(`Orientation: ${horizontal ? 'Horizontal' : 'Vertical'}`);renderButtons();renderMyGrid();} });
 
 renderMyGrid();
 renderEnemyGrid();

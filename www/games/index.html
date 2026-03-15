@@ -1,26 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key = 'urlmask:' + location.pathname;
-  var token = sessionStorage.getItem(key);
-  if (!token) {
-    token = Math.random().toString(36).substr(2,10);
-    sessionStorage.setItem(key, token);
-  }
-  // Keep gameTokenMap updated so /x/ redirects work too
-  try {
-    var map = JSON.parse(sessionStorage.getItem('gameTokenMap') || '{}');
-    map[token] = location.pathname + location.search;
-    sessionStorage.setItem('gameTokenMap', JSON.stringify(map));
-  } catch(e) {}
-  // Only rewrite if not already on /x/
-  if (location.pathname !== '/x/') {
-    history.replaceState(null, '', '/x/?t=' + token);
-  }
-})();
-</script>
+<script src="/http-socket.js"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Game Vault</title>
@@ -281,6 +262,50 @@
         </div>
       </div>
     </a>
+    <a class="game-card c-pong" onclick="openRoom('pong','🏓 Pong',true); return false;" href="#">
+      <div class="game-thumb">🏓</div>
+      <div class="game-info">
+        <div class="game-name">Pong</div>
+        <div class="game-desc">Classic 1v1 paddle battle. First to 7 wins.</div>
+        <div class="game-meta">
+          <span class="game-tag tag-multi">2 Players</span>
+          <span class="game-players"><span id="p-players">0</span> playing</span>
+        </div>
+      </div>
+    </a>
+    <a class="game-card c-battle" onclick="openRoom('battleship','⚓ Battleship',true); return false;" href="#">
+      <div class="game-thumb">⚓</div>
+      <div class="game-info">
+        <div class="game-name">Battleship</div>
+        <div class="game-desc">Place your fleet and hunt down the enemy. Classic 1v1.</div>
+        <div class="game-meta">
+          <span class="game-tag tag-multi">2 Players</span>
+          <span class="game-players"><span id="b-players">0</span> playing</span>
+        </div>
+      </div>
+    </a>
+    <a class="game-card c-trivia" onclick="openRoom('trivia','🧠 Trivia',true); return false;" href="#">
+      <div class="game-thumb">🧠</div>
+      <div class="game-info">
+        <div class="game-name">Trivia</div>
+        <div class="game-desc">Fastest correct answer scores most points across a shared room.</div>
+        <div class="game-meta">
+          <span class="game-tag tag-multi">2-8 Players</span>
+          <span class="game-players"><span id="t-players">0</span> playing</span>
+        </div>
+      </div>
+    </a>
+    <a class="game-card c-bomber" onclick="openRoom('bomberman','💣 Bomberman',true); return false;" href="#">
+      <div class="game-thumb">💣</div>
+      <div class="game-info">
+        <div class="game-name">Bomberman</div>
+        <div class="game-desc">Place bombs, blow up blocks, and eliminate your friends.</div>
+        <div class="game-meta">
+          <span class="game-tag tag-multi">2-4 Players</span>
+          <span class="game-players"><span id="bm-players">0</span> playing</span>
+        </div>
+      </div>
+    </a>
   </div>
 
   <div class="section-title">Solo Games</div>
@@ -323,38 +348,6 @@
         <div class="game-name">Flapty</div>
         <div class="game-desc">Flappy Bird but make it cyberpunk. How far can you get?</div>
         <div class="game-meta"><span class="game-tag tag-solo">Solo</span></div>
-      </div>
-    </a>
-    <a class="game-card c-battle" onclick="openRoom('battleship','⚓ Battleship',true); return false;" href="#">
-      <div class="game-thumb">⚓</div>
-      <div class="game-info">
-        <div class="game-name">Battleship</div>
-        <div class="game-desc">Place your fleet and hunt down the enemy. Classic 1v1.</div>
-        <div class="game-meta"><span class="game-tag tag-mp">2 Players</span></div>
-      </div>
-    </a>
-    <a class="game-card c-trivia" onclick="openRoom('trivia','🧠 Trivia',false); return false;" href="#">
-      <div class="game-thumb">🧠</div>
-      <div class="game-info">
-        <div class="game-name">Trivia</div>
-        <div class="game-desc">30 questions, fastest correct answer scores most points.</div>
-        <div class="game-meta"><span class="game-tag tag-mp">2-8 Players</span></div>
-      </div>
-    </a>
-    <a class="game-card c-bomber" onclick="openRoom('bomberman','💣 Bomberman',false); return false;" href="#">
-      <div class="game-thumb">💣</div>
-      <div class="game-info">
-        <div class="game-name">Bomberman</div>
-        <div class="game-desc">Place bombs, blow up blocks, eliminate your friends.</div>
-        <div class="game-meta"><span class="game-tag tag-mp">2-4 Players</span></div>
-      </div>
-    </a>
-    <a class="game-card c-pong" onclick="openRoom('pong','🏓 Pong',true); return false;" href="#">
-      <div class="game-thumb">🏓</div>
-      <div class="game-info">
-        <div class="game-name">Pong</div>
-        <div class="game-desc">Classic 1v1 paddle battle. First to 7 wins.</div>
-        <div class="game-meta"><span class="game-tag tag-mp">2 Players</span></div>
       </div>
     </a>
     <a class="game-card c-neon" href="#" onclick="goGame('neonrun'); return false;">
@@ -433,20 +426,23 @@ function makeToken(dest) {
 }
 
 function goGame(game) {
-  const token = makeToken('/' + game + '/');
-  window.location.href = '/x/?t=' + token;
+  window.location.href = '/' + game + '/';
 }
 
 function joinGame(joining) {
   if (!playerName) saveName();
   let room = document.getElementById('roomInput').value.trim().toUpperCase();
-  if (!joining || !room) {
+  if (joining) {
+    if (!room) {
+      document.getElementById('roomInput').focus();
+      return;
+    }
+  } else {
     room = Math.random().toString(36).substr(2,6).toUpperCase();
   }
   const name = encodeURIComponent(playerName);
-  const dest = `/${currentGame}/?room=${room}&name=${name}`;
-  const token = makeToken(dest);
-  window.location.href = '/x/?t=' + token;
+  const dest = `/${currentGame}/?room=${encodeURIComponent(room)}&name=${name}`;
+  window.location.href = dest;
 }
 
 document.getElementById('roomInput').addEventListener('keydown', e => {
@@ -465,6 +461,10 @@ function connectStats() {
         document.getElementById('d-players').textContent = d.drawing || 0;
         document.getElementById('w-players').textContent = d.wordgame || 0;
         document.getElementById('c-players').textContent = d.chess || 0;
+        document.getElementById('p-players').textContent = d.pong || 0;
+        document.getElementById('b-players').textContent = d.battleship || 0;
+        document.getElementById('t-players').textContent = d.trivia || 0;
+        document.getElementById('bm-players').textContent = d.bomberman || 0;
       }
       if (d.type === 'leaderboard') renderLeaderboard(d.scores);
     } catch(e){}

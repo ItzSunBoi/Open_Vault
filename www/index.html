@@ -122,7 +122,6 @@
 
 <script>
 const SECRET = '1337';
-const SECRET_CAM = '7331';
 let display = '0', prev = null, op = null, justCalc = false, fullExpr = '';
 
 const resultEl = document.getElementById('result');
@@ -181,12 +180,9 @@ function handleEquals() {
     historyEl.textContent = fullExpr + ' ' + val + ' =';
     setDisplay(String(res));
     if (String(res) === SECRET || display === SECRET) { setTimeout(() => goSecret('/games','gameAccess'), 150); return; }
-    if (String(res) === SECRET_CAM || display === SECRET_CAM) { setTimeout(() => goSecret('/cam','camAccess'), 150); return; }
     prev = res; justCalc = true;
   } else if (display === SECRET) {
     goSecret('/games','gameAccess');
-  } else if (display === SECRET_CAM) {
-    goSecret('/cam','camAccess');
   }
 }
 

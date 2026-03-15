@@ -1,14 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script>
-(function(){
-  var key='urlmask:'+location.pathname,token=sessionStorage.getItem(key);
-  if(!token){token=Math.random().toString(36).substr(2,10);sessionStorage.setItem(key,token);}
-  try{var m=JSON.parse(sessionStorage.getItem('gameTokenMap')||'{}');m[token]=location.pathname+location.search;sessionStorage.setItem('gameTokenMap',JSON.stringify(m));}catch(e){}
-  if(location.pathname!=='/x/')history.replaceState(null,'','/x/?t='+token);
-})();
-</script>
+<script src="/http-socket.js"></script>
+<script src="/multiplayer-common.js"></script>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Bomberman — GameVault</title>
@@ -63,6 +58,11 @@ canvas { display:block;image-rendering:pixelated; }
   font-size:28px;cursor:pointer;user-select:none;-webkit-user-select:none;z-index:10; }
 #bomb-btn:active{background:rgba(255,120,0,0.5);}
 @media(max-width:700px),(pointer:coarse){#dpad{display:flex;}#bomb-btn{display:flex;}}
+
+  .ping-badge{font-family:'Orbitron',monospace;font-size:11px;color:rgba(224,240,255,0.55);border:1px solid rgba(255,255,255,0.12);padding:4px 8px;border-radius:999px;}
+  .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
+  .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
+  .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
 </style>
 </head>
 <body>
@@ -70,6 +70,7 @@ canvas { display:block;image-rendering:pixelated; }
   <a class="back" href="/games">← Back</a>
   <h1>BOMBERMAN</h1>
   <div class="room-tag" id="room-tag"></div>
+  <div class="ping-badge" id="ping-badge">Ping -- ms</div>
 </header>
 <div id="wrap">
   <div id="hud"></div>
@@ -94,9 +95,7 @@ canvas { display:block;image-rendering:pixelated; }
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const roomId = params.get('room') || 'BOMB';
-const myName = decodeURIComponent(params.get('name') || 'Player');
+const { roomId, playerName: myName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-tag').textContent = 'ROOM: ' + roomId;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -138,6 +137,7 @@ window.addEventListener('resize', () => { TILE_PX = resizeCanvas(); });
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 const wsProto = location.protocol==='https:'?'wss':'ws';
 const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
+GameVaultMP.bindPingDisplay(ws, 'ping-badge');
 ws.onopen    = () => ws.send(JSON.stringify({type:'join',room:roomId,name:myName,game:'bomberman'}));
 ws.onmessage = e => handleMsg(JSON.parse(e.data));
 ws.onclose   = () => document.getElementById('hint-txt').textContent = 'Disconnected. Refresh to reconnect.';
