@@ -59,6 +59,12 @@
   .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
   .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
   .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
+
+  .round-block{display:flex;flex-direction:column;gap:8px;margin-top:auto;} .round-info{font-size:13px;color:rgba(224,240,255,0.5);text-align:left;padding:8px 10px;background:rgba(255,136,0,0.08);border:1px solid rgba(255,136,0,0.16);border-radius:10px;font-family:'Orbitron',monospace;letter-spacing:1px;} .ledger-panel{width:100%;max-height:220px;overflow:auto;background:rgba(5,7,15,0.72);border:1px solid rgba(0,255,170,0.15);border-radius:12px;padding:10px;} .ledger-toggle{width:100%;background:transparent;border:1px solid rgba(0,255,170,0.2);color:#00ffaa;border-radius:8px;padding:6px 8px;font-family:'Orbitron',monospace;font-size:11px;letter-spacing:1px;cursor:pointer;text-transform:uppercase;} .ledger-panel.collapsed #ledger-list,.ledger-panel.collapsed .ledger-title{display:none;} 
+  .ledger-title{font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;color:#00ffaa;margin-bottom:8px;text-transform:uppercase;}
+  .ledger-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:rgba(224,240,255,0.82);padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);} 
+  .ledger-row:last-child{border-bottom:none;} .ledger-rank{color:#00ffaa;font-family:'Orbitron',monospace;width:20px;} .ledger-empty{font-size:12px;color:rgba(224,240,255,0.45);} 
+
 </style>
 </head>
 <body>
@@ -72,8 +78,13 @@
   <div class="left-panel">
     <div class="panel-title">Players</div>
     <div class="player-list" id="player-list"></div>
-    <div style="margin-top:auto;">
+    <div class="round-block">
       <div class="round-info" id="round-info">Waiting for players...</div>
+      <div class="ledger-panel collapsed" id="ledger-panel">
+        <button class="ledger-toggle" id="ledger-toggle" type="button" onclick="toggleLedger()">Show Archive Ledger</button>
+        <div class="ledger-title">Archive Ledger</div>
+        <div id="ledger-list" class="ledger-empty">Waiting for ledger…</div>
+      </div>
     </div>
   </div>
   <div class="center" style="position:relative;">
@@ -108,6 +119,7 @@
 </div>
 
 <script>
+const LEDGER_GAME = 'Drawing';
 const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-badge').textContent = 'Room: ' + roomId;
 
@@ -243,15 +255,47 @@ function renderPlayers(players) {
 }
 
 // WebSocket
+
+function copyRoomLink() {
+  const url = `${location.origin}/vault-sketch/?room=${encodeURIComponent(roomId)}`;
+  navigator.clipboard.writeText(url).then(() => addMsg('', 'Room link copied', 'system')).catch(() => alert(url));
+}
+
+function renderLobbyOverlay(title, message, actionHtml='') {
+  document.getElementById('overlay').style.display = 'flex';
+  document.getElementById('overlay').innerHTML = `
+    <h2>${title}</h2>
+    <div style="font-family:'Orbitron',monospace;font-size:22px;color:#00ffaa;letter-spacing:4px;padding:10px 16px;border:1px solid rgba(0,255,170,0.25);border-radius:10px;background:rgba(0,255,170,0.06)">ROOM ${roomId}</div>
+    <p style="color:rgba(224,240,255,0.6)">${message}</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">${actionHtml}<button class="btn" onclick="copyRoomLink()">Copy Room Link</button></div>
+  `;
+}
+
+
+function renderLedger(scores) {
+  scores = (scores || []).filter(s => s && s.game === LEDGER_GAME);
+  const el = document.getElementById('ledger-list');
+  if (!el) return;
+  if (!scores || !scores.length) { el.innerHTML = '<div class="ledger-empty">No ledger entries yet.</div>'; return; }
+  el.innerHTML = scores.slice(0,10).map((s,i)=>`<div class="ledger-row"><span class="ledger-rank">${i+1}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</span><span>${s.score}</span></div>`).join('');
+}
+function toggleLedger() {
+  const panel = document.getElementById('ledger-panel');
+  const btn = document.getElementById('ledger-toggle');
+  const collapsed = panel.classList.toggle('collapsed');
+  btn.textContent = collapsed ? 'Show Archive Ledger' : 'Hide Archive Ledger';
+}
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   GameVaultMP.bindPingDisplay(ws, 'ping-badge');
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'drawing' }));
+    ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'drawing' })); ws.send(JSON.stringify({ type: 'get_stats' }));
   };
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    if (d.type === 'leaderboard') { renderLedger(d.scores); return; }
     if (d.type === 'join_error') {
       alert(d.error || 'Unable to join this room.');
       return;
@@ -259,12 +303,7 @@ function connect() {
     if (d.type === 'joined') {
       addMsg('', `Welcome, ${playerName}! Room: ${roomId}`, 'system');
       renderPlayers(d.players || []);
-      document.getElementById('overlay').style.display = 'flex';
-      document.getElementById('overlay').innerHTML = `
-        <h2>Vault Sketch</h2>
-        <p style="color:rgba(224,240,255,0.6)">Room ${roomId} — waiting for players...</p>
-        ${d.isHost ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Begin Sequence</button>` : ''}
-      `;
+      renderLobbyOverlay('Vault Sketch', 'Waiting for players...', d.isHost ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Begin Sequence</button>` : '');
     }
     if (d.type === 'player_joined') { addMsg('', `${d.name} joined`, 'system'); renderPlayers(d.players); }
     if (d.type === 'player_left') { addMsg('', `${d.name} left`, 'system'); renderPlayers(d.players); }
@@ -285,7 +324,16 @@ function connect() {
         document.getElementById('chat-input').placeholder = 'Type guess...';
         document.getElementById('chat-input').disabled = false;
       }
-      initCanvas(); startTimer(d.timeLeft || 60);
+      initCanvas();
+      (d.drawingActions || []).forEach(a => {
+        if (!a || !a.type) return;
+        if (a.type === 'draw_clear') { initCanvas(); return; }
+        if (a.type === 'draw') {
+          if (a.action === 'start') { ctx.beginPath(); ctx.moveTo(a.x * canvas.width, a.y * canvas.height); }
+          else if (a.action === 'move') { drawLine(a.x * canvas.width, a.y * canvas.height, a.color, a.size); }
+        }
+      });
+      startTimer(d.timeLeft || 60);
       renderPlayers(d.players);
     }
     if (d.type === 'draw') {
@@ -303,20 +351,10 @@ function connect() {
     }
     if (d.type === 'game_over') {
       addMsg('', `Sequence closed! Victor: ${d.winner}`, 'system');
-      document.getElementById('overlay').style.display = 'flex';
-      document.getElementById('overlay').innerHTML = `
-        <h2>Sequence Closed!</h2>
-        <p style="color:rgba(224,240,255,0.6)">Winner: ${d.winner}</p>
-        <button class="btn" onclick="document.getElementById('overlay').style.display='none';ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Play Again</button>
-      `;
+      renderLobbyOverlay('Sequence Closed!', `Winner: ${d.winner}`, isHost ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Play Again</button>` : '');
     }
     if (d.type === 'waiting') {
-      document.getElementById('overlay').style.display = 'flex';
-      document.getElementById('overlay').innerHTML = `
-        <h2>Vault Sketch</h2>
-        <p style="color:rgba(224,240,255,0.6)">${d.message || 'Waiting for more players...'}</p>
-        ${d.canStart ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Begin Sequence</button>` : ''}
-      `;
+      renderLobbyOverlay('Vault Sketch', d.message || 'Waiting for more players...', d.canStart ? `<button class="btn" onclick="ws.send(JSON.stringify({type:'start_game',room:'${roomId}'}))">Begin Sequence</button>` : '');
     }
     if (d.type === 'timer') { document.getElementById('timer').textContent = d.value; }
   };

@@ -52,6 +52,12 @@
   .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
   .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
   .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
+
+  .ledger-panel{position:fixed;right:10px;bottom:10px;width:220px;max-height:260px;overflow:auto;background:rgba(5,7,15,0.92);border:1px solid rgba(0,255,170,0.15);border-radius:12px;padding:10px;z-index:40;backdrop-filter:blur(4px);} 
+  .ledger-title{font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;color:#00ffaa;margin-bottom:8px;text-transform:uppercase;}
+  .ledger-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:rgba(224,240,255,0.82);padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);} 
+  .ledger-row:last-child{border-bottom:none;} .ledger-rank{color:#00ffaa;font-family:'Orbitron',monospace;width:20px;} .ledger-empty{font-size:12px;color:rgba(224,240,255,0.45);} 
+
 </style>
 </head>
 <body>
@@ -80,9 +86,11 @@
   <div class="room-code" id="room-code">ROOM ---</div>
   <p id="overlay-msg">Connecting...</p>
   <button class="btn" id="start-btn" style="display:none" onclick="beginSequence()">Begin Sequence</button>
+  <button class="btn" type="button" onclick="copyRoomLink()">Copy Room Link</button>
 </div>
 
 <script>
+const LEDGER_GAME = 'Word Bomb';
 const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-badge').textContent = 'Room: ' + roomId;
 document.getElementById('room-code').textContent = 'ROOM ' + roomId;
@@ -130,6 +138,11 @@ function beginSequence() {
   ws && ws.send(JSON.stringify({ type: 'start_game', room: roomId }));
 }
 
+function copyRoomLink() {
+  const url = `${location.origin}/vault-lex/?room=${encodeURIComponent(roomId)}`;
+  navigator.clipboard.writeText(url).then(() => addLog('Room link copied', 'sys')).catch(() => alert(url));
+}
+
 const wordInput = document.getElementById('word-input');
 wordInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && isMyTurn) {
@@ -140,13 +153,22 @@ wordInput.addEventListener('keydown', e => {
   }
 });
 
+
+function renderLedger(scores) {
+  scores = (scores || []).filter(s => s && s.game === LEDGER_GAME);
+  const el = document.getElementById('ledger-list');
+  if (!el) return;
+  if (!scores || !scores.length) { el.innerHTML = '<div class="ledger-empty">No ledger entries yet.</div>'; return; }
+  el.innerHTML = scores.slice(0,10).map((s,i)=>`<div class="ledger-row"><span class="ledger-rank">${i+1}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</span><span>${s.score}</span></div>`).join('');
+}
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   GameVaultMP.bindPingDisplay(ws, 'ping-badge');
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'wordgame' }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'wordgame' })); ws.send(JSON.stringify({ type: 'get_stats' }));
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    if (d.type === 'leaderboard') { renderLedger(d.scores); return; }
     if (d.type === 'join_error') {
       alert(d.error || 'Unable to join this room.');
       return;
@@ -163,6 +185,10 @@ function connect() {
       document.getElementById('overlay').style.display = 'flex';
       document.getElementById('overlay-msg').textContent = `Room ${roomId} — ${d.players.length} player(s). ${d.players.length < 2 ? 'Need 2 to start.' : 'Ready to start.'}`;
       document.getElementById('start-btn').style.display = isHost ? 'block' : 'none';
+      renderPlayers(d.players.map(p => ({...p, isMe: p.name === playerName})));
+    }
+    if (d.type === 'player_reconnected') {
+      addLog(`${d.name} reconnected`, 'sys');
       renderPlayers(d.players.map(p => ({...p, isMe: p.name === playerName})));
     }
     if (d.type === 'player_left') {
@@ -220,7 +246,8 @@ function connect() {
         <h2>◇ Sequence Closed!</h2>
         <div class="room-code">ROOM ${roomId}</div>
         <p style="color:rgba(224,240,255,0.6)">Winner: <strong>${d.winner}</strong></p>
-        <button class="btn" onclick="location.reload()">Play Again</button>
+        ${isHost ? `<button class="btn" onclick="beginSequence()">Play Again</button>` : ''}
+        <button class="btn" onclick="copyRoomLink()">Copy Room Link</button>
         <a href="/vault" style="color:rgba(224,240,255,0.4);font-size:13px;margin-top:8px">Back to atlas</a>
       `;
     }
@@ -230,5 +257,6 @@ function connect() {
 
 connect();
 </script>
+<div class="ledger-panel"><div class="ledger-title">Archive Ledger</div><div id="ledger-list" class="ledger-empty">Waiting for ledger…</div></div>
 </body>
 </html>

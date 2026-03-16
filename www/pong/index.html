@@ -47,6 +47,12 @@ canvas { display:block;image-rendering:pixelated; }
   .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
   .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
   .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
+
+  .ledger-panel{position:fixed;right:10px;bottom:10px;width:220px;max-height:260px;overflow:auto;background:rgba(5,7,15,0.92);border:1px solid rgba(0,255,170,0.15);border-radius:12px;padding:10px;z-index:40;backdrop-filter:blur(4px);} 
+  .ledger-title{font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;color:#00ffaa;margin-bottom:8px;text-transform:uppercase;}
+  .ledger-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:rgba(224,240,255,0.82);padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);} 
+  .ledger-row:last-child{border-bottom:none;} .ledger-rank{color:#00ffaa;font-family:'Orbitron',monospace;width:20px;} .ledger-empty{font-size:12px;color:rgba(224,240,255,0.45);} 
+
 </style>
 </head>
 <body>
@@ -71,15 +77,18 @@ canvas { display:block;image-rendering:pixelated; }
     <div class="sub" id="ov-sub">MULTIPLAYER</div>
     <h2 id="ov-title">VAULT PADDLE</h2>
     <div class="score-big" id="ov-score" style="display:none">0 — 0</div>
+    <div class="sub" id="ov-room">ROOM ---</div>
     <p id="ov-msg">Loading...</p>
-    <button class="ready-btn" id="ready-btn" style="display:none" onclick="sendReady()">Ready</button>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center"><button class="ready-btn" id="ready-btn" style="display:none" onclick="sendReady()">Ready</button><button class="ready-btn" id="copy-btn" type="button" onclick="copyRoomLink()">Copy Room Link</button></div>
   </div>
 </div>
 
 <script>
 // ─── Params ───────────────────────────────────────────────────────────────────
+const LEDGER_GAME = 'Pong';
 const { roomId, playerName: myName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-info').textContent = 'ROOM: ' + roomId;
+document.getElementById('ov-room').textContent = 'ROOM ' + roomId;
 
 // ─── Canvas ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
@@ -116,7 +125,7 @@ const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
 GameVaultMP.bindPingDisplay(ws, 'ping-badge');
 
 ws.onopen = () => {
-  ws.send(JSON.stringify({ type: 'join', room: roomId, name: myName, game: 'pong' }));
+  ws.send(JSON.stringify({ type: 'join', room: roomId, name: myName, game: 'pong' })); ws.send(JSON.stringify({ type: 'get_stats' }));
 };
 
 ws.onmessage = (e) => {
@@ -132,6 +141,14 @@ ws.onclose = () => {
   showOverlay('DISCONNECTED', 'Connection lost. Please refresh.', false);
 };
 
+
+function renderLedger(scores) {
+  scores = (scores || []).filter(s => s && s.game === LEDGER_GAME);
+  const el = document.getElementById('ledger-list');
+  if (!el) return;
+  if (!scores || !scores.length) { el.innerHTML = '<div class="ledger-empty">No ledger entries yet.</div>'; return; }
+  el.innerHTML = scores.slice(0,10).map((s,i)=>`<div class="ledger-row"><span class="ledger-rank">${i+1}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</span><span>${s.score}</span></div>`).join('');
+}
 function handleMsg(msg) {
   switch (msg.type) {
     case 'joined':
@@ -175,6 +192,11 @@ function handleMsg(msg) {
   }
 }
 
+function copyRoomLink() {
+  const url = `${location.origin}/vault-paddle/?room=${encodeURIComponent(roomId)}`;
+  navigator.clipboard.writeText(url).then(() => {}).catch(() => alert(url));
+}
+
 function sendReady() {
   ws.send(JSON.stringify({ type: 'pong_ready' }));
   document.getElementById('ready-btn').disabled = true;
@@ -204,7 +226,7 @@ function showOverlay(title, scoreText, showBtn, color='#00c8ff') {
   btn.style.display = showBtn ? 'block' : 'none';
   btn.textContent = 'Play Again';
   btn.disabled = false;
-  btn.onclick = () => location.reload();
+  btn.onclick = () => sendReady();
 }
 
 function hideOverlay() {
@@ -320,5 +342,6 @@ function drawPaddle(x, cy, isMe) {
 setOverlay('VAULT PADDLE', 'Linking...', false);
 requestAnimationFrame(loop);
 </script>
+<div class="ledger-panel"><div class="ledger-title">Archive Ledger</div><div id="ledger-list" class="ledger-empty">Waiting for ledger…</div></div>
 </body>
 </html>

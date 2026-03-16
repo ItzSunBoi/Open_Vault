@@ -19,6 +19,8 @@
   .board-wrap{position:relative;}
   #board{display:grid;grid-template-columns:repeat(8,62px);grid-template-rows:repeat(8,62px);border:2px solid rgba(0,204,68,0.3);box-shadow:0 0 30px rgba(0,204,68,0.1);}
   .sq{width:62px;height:62px;display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer;position:relative;user-select:none;transition:background .1s;}
+  .piece-svg{width:46px;height:46px;display:block;}
+  .promo-piece .piece-svg{width:52px;height:52px;}
   .sq.light{background:#1a2e1a;}
   .sq.dark{background:#0d1a0d;}
   .sq.selected{background:rgba(0,255,100,0.4)!important;}
@@ -56,6 +58,12 @@
   .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
   .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
   .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
+
+  .ledger-panel{position:fixed;right:10px;bottom:10px;width:220px;max-height:260px;overflow:auto;background:rgba(5,7,15,0.92);border:1px solid rgba(0,255,170,0.15);border-radius:12px;padding:10px;z-index:40;backdrop-filter:blur(4px);} 
+  .ledger-title{font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;color:#00ffaa;margin-bottom:8px;text-transform:uppercase;}
+  .ledger-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:rgba(224,240,255,0.82);padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);} 
+  .ledger-row:last-child{border-bottom:none;} .ledger-rank{color:#00ffaa;font-family:'Orbitron',monospace;width:20px;} .ledger-empty{font-size:12px;color:rgba(224,240,255,0.45);} 
+
 </style>
 </head>
 <body>
@@ -91,25 +99,44 @@
 
 <div class="promo-modal" id="promo">
   <div class="promo-box">
-    <div class="promo-piece" onclick="promote('q')">♛</div>
-    <div class="promo-piece" onclick="promote('r')">♜</div>
-    <div class="promo-piece" onclick="promote('b')">♝</div>
-    <div class="promo-piece" onclick="promote('n')">♞</div>
+    <div class="promo-piece" id="promo-q" onclick="promote('q')"></div>
+    <div class="promo-piece" id="promo-r" onclick="promote('r')"></div>
+    <div class="promo-piece" id="promo-b" onclick="promote('b')"></div>
+    <div class="promo-piece" id="promo-n" onclick="promote('n')"></div>
   </div>
 </div>
 
 <script>
+const LEDGER_GAME = 'Chess';
 const { roomId, playerName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 
 document.getElementById('room-code').textContent = roomId;
 
-const PIECES = {
-  'wK':'♔','wQ':'♕','wR':'♖','wB':'♗','wN':'♘','wP':'♙',
-  'bK':'♚','bQ':'♛','bR':'♜','bB':'♝','bN':'♞','bP':'♟'
-};
+const PIECE_GLYPHS = { k:'♚', q:'♛', r:'♜', b:'♝', n:'♞', p:'♟' };
+function pieceSvg(color, type) {
+  const fill = color === 'w' ? '#f7fff7' : '#102018';
+  const stroke = color === 'w' ? '#16301f' : '#f1fff4';
+  const glyph = PIECE_GLYPHS[type] || '?';
+  const bg = color === 'w' ? 'rgba(255,255,255,0.88)' : 'rgba(0,0,0,0.42)';
+  return `<svg class="piece-svg" viewBox="0 0 64 64" aria-hidden="true">
+    <rect x="6" y="6" width="52" height="52" rx="14" fill="${bg}" stroke="${stroke}" stroke-width="3"/>
+    <text x="32" y="43" text-anchor="middle" font-size="34" font-weight="700" font-family="'DejaVu Sans','Segoe UI Symbol','Noto Sans Symbols 2',serif" fill="${stroke}">${glyph}</text>
+  </svg>`;
+}
 
 let chess = new Chess();
+let chessHistory = [];
 let myColor = null, selected = null, legalMoves = [], lastMove = null;
+let matchStarted = false;
+
+function renderPromoChoices() {
+  const color = myColor || 'w';
+  [['promo-q','q'], ['promo-r','r'], ['promo-b','b'], ['promo-n','n']].forEach(([id, type]) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = pieceSvg(color, type);
+  });
+}
+
 let pendingPromo = null, ws = null;
 
 function buildBoard() {
@@ -131,7 +158,7 @@ function buildBoard() {
       sq.dataset.sq = sqName;
       
       const piece = chess.get(sqName);
-      if (piece) sq.textContent = PIECES[(piece.color === 'w' ? 'w' : 'b') + piece.type.toUpperCase()];
+      if (piece) sq.innerHTML = pieceSvg(piece.color, piece.type);
       
       if (selected === sqName) sq.classList.add('selected');
       if (legalMoves.includes(sqName)) sq.classList.add('legal');
@@ -158,6 +185,7 @@ function findKing(color) {
 
 function onSquareClick(sqName) {
   if (!myColor) return;
+  if (!matchStarted) { setStatus('Waiting for opponent...'); return; }
   if (chess.turn() !== myColor[0]) { setStatus('Not your turn'); return; }
   
   if (selected) {
@@ -213,53 +241,80 @@ function updateStatus() {
 function setStatus(html) { document.getElementById('status').innerHTML = html; }
 
 function updateMoveList() {
-  const history = chess.history();
+  const history = chessHistory || [];
   const ml = document.getElementById('move-list');
   let html = '';
   for (let i = 0; i < history.length; i += 2) {
-    html += `<div class="move-pair"><span class="move-num">${i/2+1}.</span><span class="move-w">${history[i]}</span><span class="move-b">${history[i+1]||''}</span></div>`;
+    html += `<div class="move-pair"><span class="move-num">${i/2+1}.</span><span class="move-w">${history[i]||''}</span><span class="move-b">${history[i+1]||''}</span></div>`;
   }
-  ml.innerHTML = html; ml.scrollTop = ml.scrollHeight;
+  ml.innerHTML = html || '<div style="color:rgba(224,240,255,0.35)">No moves yet.</div>'; ml.scrollTop = ml.scrollHeight;
 }
 
 function copyRoom() {
-  const url = `${location.origin}/vault-rook/?room=${roomId}&name=${encodeURIComponent(playerName)}`;
+  const url = `${location.origin}/vault-rook/?room=${encodeURIComponent(roomId)}`;
   navigator.clipboard.writeText(url).then(() => alert('Room link copied!')).catch(() => alert(url));
 }
 
 // WebSocket
+
+function renderLedger(scores) {
+  scores = (scores || []).filter(s => s && s.game === LEDGER_GAME);
+  const el = document.getElementById('ledger-list');
+  if (!el) return;
+  if (!scores || !scores.length) { el.innerHTML = '<div class="ledger-empty">No ledger entries yet.</div>'; return; }
+  el.innerHTML = scores.slice(0,10).map((s,i)=>`<div class="ledger-row"><span class="ledger-rank">${i+1}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</span><span>${s.score}</span></div>`).join('');
+}
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   GameVaultMP.bindPingDisplay(ws, 'ping-badge');
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'chess' }));
+    ws.send(JSON.stringify({ type: 'join', room: roomId, name: playerName, game: 'chess' })); ws.send(JSON.stringify({ type: 'get_stats' }));
   };
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    if (d.type === 'leaderboard') { renderLedger(d.scores); return; }
     if (d.type === 'join_error') {
       alert(d.error || 'Unable to join this room.');
       return;
     }
     if (d.type === 'joined') {
       myColor = d.color;
+      matchStarted = false;
       setStatus(`You are <span class="highlight">${myColor === 'w' ? 'White' : 'Black'}</span> — waiting for opponent...`);
+      renderPromoChoices();
       buildBoard();
     }
     if (d.type === 'game_start') {
+      matchStarted = true;
       setStatus(`Sequence initiated! ${chess.turn() === myColor[0] ? '<span class="highlight">YOUR TURN</span>' : "Opponent's turn"}`);
       buildBoard();
     }
+    if (d.type === 'chess_sync' && d.fen) {
+      chess.load(d.fen);
+      chessHistory = d.history || chessHistory || [];
+      selected = null; legalMoves = [];
+      buildBoard(); updateStatus(); updateMoveList();
+    }
     if (d.type === 'chess_move') {
-      chess.move({ from: d.from, to: d.to, promotion: d.promotion || 'q' });
+      if (d.fen) chess.load(d.fen);
+      else chess.move({ from: d.from, to: d.to, promotion: d.promotion || 'q' });
+      chessHistory = d.history || chessHistory || [];
       lastMove = { from: d.from, to: d.to };
       selected = null; legalMoves = [];
       buildBoard(); updateStatus(); updateMoveList();
     }
     if (d.type === 'opponent_left') {
+      matchStarted = false;
       setStatus('<span class="highlight">Opponent disconnected.</span>');
     }
-    if (d.type === 'error') setStatus(d.message);
+    if (d.type === 'error') {
+      selected = null; legalMoves = [];
+      if (d.fen) chess.load(d.fen);
+      if (d.history) chessHistory = d.history;
+      buildBoard(); updateStatus(); updateMoveList();
+      setStatus(d.message);
+    }
   };
   ws.onclose = () => { setTimeout(connect, 3000); };
 }
@@ -267,5 +322,6 @@ function connect() {
 connect();
 buildBoard();
 </script>
+<div class="ledger-panel"><div class="ledger-title">Archive Ledger</div><div id="ledger-list" class="ledger-empty">Waiting for ledger…</div></div>
 </body>
 </html>

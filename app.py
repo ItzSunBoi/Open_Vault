@@ -19,6 +19,11 @@ try:
 except Exception:
     zipf_frequency = None
 
+try:
+    import chess as pychess
+except Exception:
+    pychess = None
+
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
@@ -38,7 +43,7 @@ def create_client():
     clients[client_id] = {
         'name': None, 'room': None, 'game': None,
         'queue': [], 'cond': threading.Condition(), 'alive': True,
-        'created_at': now, 'last_seen': now,
+        'created_at': now, 'last_seen': now, 'disconnected_at': None,
     }
     return client_id
 
@@ -47,6 +52,8 @@ def touch_client(client_id):
     info = clients.get(client_id)
     if info:
         info['last_seen'] = time.time()
+        info['disconnected_at'] = None
+        info['alive'] = True
 
 
 def disconnect_client(client_id):
@@ -54,12 +61,11 @@ def disconnect_client(client_id):
     if not info:
         return
     info['alive'] = False
-    leave_room(client_id)
+    info['disconnected_at'] = time.time()
     cond = info.get('cond')
     if cond is not None:
         with cond:
             cond.notify_all()
-    clients.pop(client_id, None)
     broadcast_stats()
 
 
@@ -342,7 +348,7 @@ def add_leaderboard(name, game, score):
     broadcast_leaderboard()
 
 def broadcast_leaderboard():
-    data = {'type': 'leaderboard', 'scores': leaderboard[:10]}
+    data = {'type': 'leaderboard', 'scores': leaderboard[:50]}
     for client_id in list(clients):
         ws_send(client_id, data)
 
@@ -401,6 +407,120 @@ def find_name_conflict(name, exclude_client_id=None):
             return True
     return False
 
+def find_room_player(room, name):
+    wanted = (sanitize_player_name(name) or '').casefold()
+    if not wanted or not room:
+        return None
+    for player in room.get('players', []):
+        if (player.get('name') or '').casefold() == wanted:
+            return player
+    return None
+
+
+def choose_wordbomb_syllable(room):
+    round_num = room.get('round', 0)
+    if round_num < 4:
+        difficulty = 'easy'
+    elif round_num < 8:
+        difficulty = 'medium'
+    else:
+        difficulty = 'hard'
+
+    pool = list(WORD_BOMB_SYLLABLES.get(difficulty, []))
+    if not pool:
+        pool = list(WORD_BOMB_SYLLABLES.get('easy', [])) + list(WORD_BOMB_SYLLABLES.get('medium', [])) + list(WORD_BOMB_SYLLABLES.get('hard', []))
+    if not pool:
+        return ''
+
+    cycle = room.setdefault('word_syllable_cycle', {})
+    state = cycle.get(difficulty)
+    if not state or state.get('pool') != pool or not state.get('remaining'):
+        remaining = list(pool)
+        random.shuffle(remaining)
+        state = {'pool': list(pool), 'remaining': remaining}
+        cycle[difficulty] = state
+
+    syllable = state['remaining'].pop(0)
+    if not state['remaining']:
+        state['remaining'] = list(pool)
+        random.shuffle(state['remaining'])
+    return syllable
+
+
+def sync_client_to_room(client_id, room, player):
+    if not room or not player:
+        return
+
+    game = room.get('game')
+    if game == 'wordgame' and room.get('game_running') and room.get('syllable'):
+        player_list = get_player_list(room)
+        current = room['players'][room['current_player_index']] if room.get('players') else None
+        if current:
+            for i, p in enumerate(player_list):
+                p['active'] = room['players'][i]['name'] == current['name']
+            ws_send(client_id, {
+                'type': 'turn',
+                'player': current['name'],
+                'syllable': room['syllable'],
+                'timeLeft': max(1, int(round(room.get('word_deadline', time.time()) - time.time()))),
+                'players': player_list,
+            })
+    elif game == 'drawing' and room.get('game_running') and room.get('players'):
+        drawer = room['players'][room['drawer_index'] % len(room['players'])]
+        hint = ' '.join('_' for _ in (room.get('current_word') or ''))
+        ws_send(client_id, {
+            'type': 'round_start',
+            'round': room.get('round', 1),
+            'totalRounds': min(len(room['players']) * 2, 8),
+            'drawer': drawer['name'],
+            'word': room.get('current_word') if player['name'] == drawer['name'] else hint,
+            'hint': hint,
+            'timeLeft': max(1, int(round(room.get('round_deadline', time.time()) - time.time()))),
+            'players': get_player_list(room),
+            'drawingActions': room.get('drawing_actions', []),
+        })
+    elif game == 'trivia' and room.get('game_running') and room.get('trivia_questions') and room.get('trivia_round', 0) < len(room['trivia_questions']):
+        q = room['trivia_questions'][room['trivia_round']]
+        ws_send(client_id, {'type': 'trivia_start', 'total': len(room['trivia_questions'])})
+        ws_send(client_id, {
+            'type': 'trivia_question',
+            'round': room['trivia_round'] + 1,
+            'total': len(room['trivia_questions']),
+            'question': q['q'],
+            'options': room.get('trivia_current_options') or q['opts'],
+            'timeLimit': max(1, int(round(room.get('trivia_deadline', time.time()) - time.time()))),
+        })
+    elif game == 'bomberman' and room.get('game_running'):
+        ws_send(client_id, {'type': 'bomb_start', **get_bomb_state(room)})
+    elif game == 'pong':
+        ps = room.get('pong', {})
+        if ps.get('running'):
+            ws_send(client_id, {'type': 'pong_start', 'scores': ps.get('scores', {'left': 0, 'right': 0})})
+            ws_send(client_id, {
+                'type': 'pong_state',
+                'ball': ps.get('ball', {'x': 400, 'y': 200}),
+                'paddles': ps.get('paddles', {'left': 160, 'right': 160}),
+            })
+    elif game == 'chess':
+        fen = room.get('chess_fen')
+        if fen:
+            ws_send(client_id, {'type': 'chess_sync', 'fen': fen, 'history': room.get('chess_history', [])})
+            if len(room.get('players', [])) >= 2:
+                ws_send(client_id, {'type': 'game_start', 'message': 'Game started!'})
+    elif game == 'battleship':
+        both_ready = len(room.get('players', [])) == 2 and all(p.get('bs_ready') for p in room.get('players', []))
+        if both_ready:
+            attacker_idx = room['players'].index(player)
+            ws_send(client_id, {
+                'type': 'bs_sync',
+                'yourTurn': attacker_idx == room.get('bs_turn', 0),
+                'selfGrid': player.get('bs_grid', []),
+                'shots': room.get('bs_shots', {}).get(player['name'], []),
+                'phase': 'battle',
+            })
+        elif player.get('bs_ready'):
+            ws_send(client_id, {'type': 'bs_wait_opponent'})
+
 @lru_cache(maxsize=20000)
 def is_valid_wordbomb_word(word):
     w = (word or '').strip().lower()
@@ -415,24 +535,37 @@ def is_valid_wordbomb_word(word):
 # ── Room management ───────────────────────────────────────────────────────────
 def create_room(room_key, game, public_room_id=None):
     return {
-        'id': public_room_id or room_key, 'key': room_key, 'game': game,
+        'id': public_room_id or room_key, 'key': room_key, 'game': game, 'finalized': False,
         'clients': set(), 'players': [], 'host': None,
         'game_running': False, 'round': 0,
-        'drawer_index': 0, 'current_word': None,
+        'drawer_index': 0, 'current_word': None, 'drawing_actions': [],
         'round_timer': None, 'word_timer': None,
+        'round_deadline': 0, 'word_deadline': 0,
         'current_player_index': 0, 'syllable': None,
+        'word_syllable_cycle': {}, 'word_used_words': set(),
+        # chess
+        'chess_fen': None, 'chess_board': None, 'chess_history': [],
         # pong
         'pong': create_pong_state(),
         # battleship
-        'bs_turn': 0,
+        'bs_turn': 0, 'bs_shots': {},
         # trivia
         'trivia_questions': [], 'trivia_round': 0,
         'trivia_answers': {}, 'trivia_deadline': 0,
-        'trivia_timer': None,
+        'trivia_timer': None, 'trivia_current_options': [],
         # bomberman
         'bomb_map': [], 'bombs': [], 'flames': [], 'powerups': [],
         'bomb_next_id': 0, 'bomb_stop': None,
     }
+
+
+def max_players_for_game(game):
+    return {
+        'pong': 2,
+        'chess': 2,
+        'battleship': 2,
+        'bomberman': 4,
+    }.get(game)
 
 
 def join_room(client_id, room_id, name, game):
@@ -445,35 +578,85 @@ def join_room(client_id, room_id, name, game):
     requested_name = sanitize_player_name(name)
     player_name = requested_name or f'Player{random.randint(100,999)}'
 
-    if find_name_conflict(player_name, exclude_client_id=client_id):
-        ws_send(client_id, {
-            'type': 'join_error',
-            'error': 'That username is already in use. Please choose a different one.'
-        })
-        return None
-
     room_key = f'{safe_game}:{safe_room_id}'
     with _glock:
         if room_key not in rooms:
             rooms[room_key] = create_room(room_key, safe_game, safe_room_id)
         room = rooms[room_key]
+        existing_player = find_room_player(room, player_name)
 
+    if room.get('finalized') and not existing_player:
+        try:
+            del rooms[room_key]
+        except Exception:
+            pass
+        room = create_room(room_key, safe_game, safe_room_id)
+        rooms[room_key] = room
+        existing_player = None
+
+    max_players = max_players_for_game(safe_game)
+    if not existing_player and max_players and len(room.get('players', [])) >= max_players:
+        ws_send(client_id, {
+            'type': 'join_error',
+            'error': 'This vault is full.'
+        })
+        return None
+
+    if find_name_conflict(player_name, exclude_client_id=client_id):
+        same_room_existing = existing_player and clients.get(existing_player.get('client_id'), {}).get('room') == room_key
+        if not same_room_existing:
+            ws_send(client_id, {
+                'type': 'join_error',
+                'error': 'That username is already in use. Please choose a different one.'
+            })
+            return None
+
+    if room.get('finalized'):
+        existing_player = None
     clients[client_id].update({'name': player_name, 'room': room_key, 'game': safe_game})
 
-    player = {
-        'name': player_name, 'client_id': client_id,
-        'score': 0, 'lives': 3, 'eliminated': False,
-        '_side': None, '_ready': False, '_chess_color': None,
-        'bs_ships': [], 'bs_grid': [], 'bs_ready': False, 'bs_sunk': 0,
-        'trivia_answered': False,
-        'bomb_pos': {'r': 0, 'c': 0}, 'bomb_power': 2,
-        'bomb_max': 1, 'bomb_count': 0, 'alive': True, 'color': None,
-        'guessed': False,
-    }
-    room['clients'].add(client_id)
-    room['players'].append(player)
+    reconnected = False
+    player = existing_player
+    if player:
+        old_client_id = player.get('client_id')
+        reconnected = True
+        if old_client_id and old_client_id in clients and old_client_id != client_id:
+            old_info = clients.get(old_client_id)
+            if old_info:
+                old_info['alive'] = False
+                old_info.update({'name': None, 'room': None, 'game': None})
+            room['clients'].discard(old_client_id)
+            clients.pop(old_client_id, None)
+        player['client_id'] = client_id
+        room['clients'].add(client_id)
+    else:
+        player = {
+            'name': player_name, 'client_id': client_id,
+            'score': 0, 'lives': 3, 'eliminated': False,
+            '_side': None, '_ready': False, '_chess_color': None,
+            'bs_ships': [], 'bs_grid': [], 'bs_ready': False, 'bs_sunk': 0,
+            'trivia_answered': False,
+            'bomb_pos': {'r': 0, 'c': 0}, 'bomb_power': 2,
+            'bomb_max': 1, 'bomb_count': 0, 'alive': True, 'color': None,
+            'guessed': False,
+        }
+        room['clients'].add(client_id)
+        room['players'].append(player)
 
     player_list = get_player_list(room)
+
+    if reconnected:
+        if safe_game == 'pong':
+            ws_send(client_id, {'type': 'joined', 'side': player.get('_side'), 'players': player_list})
+        elif safe_game == 'chess':
+            ws_send(client_id, {'type': 'joined', 'color': player.get('_chess_color'), 'players': player_list})
+        elif safe_game == 'battleship':
+            ws_send(client_id, {'type': 'joined', 'players': player_list, 'isHost': room.get('host') == client_id})
+        else:
+            ws_send(client_id, {'type': 'joined', 'players': player_list, 'isHost': room.get('host') == client_id})
+        sync_client_to_room(client_id, room, player)
+        broadcast_all(room, {'type': 'player_reconnected', 'name': player_name, 'players': player_list})
+        return {'name': player_name, 'room': safe_room_id, 'game': safe_game}
 
     if safe_game == 'pong':
         side = 'left' if len(room['players']) <= 1 else 'right'
@@ -486,11 +669,35 @@ def join_room(client_id, room_id, name, game):
             ws_send(client_id, {'type': 'pong_waiting', 'message': 'Waiting for opponent...'})
 
     elif safe_game == 'chess':
-        color = 'w' if len(room['players']) <= 1 else 'b'
+        if len(room['players']) == 1:
+            color = 'w'
+        elif len(room['players']) == 2:
+            color = 'b' if room['players'][0].get('_chess_color') == 'w' else 'w'
+        else:
+            color = 'w'
         player['_chess_color'] = color
-        ws_send(client_id, {'type': 'joined', 'color': color, 'players': player_list})
+        if pychess is not None and room.get('chess_board') is None:
+            room['chess_board'] = pychess.Board()
+            room['chess_fen'] = room['chess_board'].fen()
         if len(room['players']) == 2:
+            colors = ['w', 'b']
+            random.shuffle(colors)
+            room['players'][0]['_chess_color'] = colors[0]
+            room['players'][1]['_chess_color'] = colors[1]
+            player_list = get_player_list(room)
+            if pychess is not None:
+                room['chess_board'] = pychess.Board()
+                room['chess_fen'] = room['chess_board'].fen()
+                room['chess_history'] = []
+            room['finalized'] = False
+            for cp in room['players']:
+                ws_send(cp['client_id'], {'type': 'joined', 'color': cp.get('_chess_color'), 'players': player_list})
             broadcast_all(room, {'type': 'game_start', 'message': 'Game started!'})
+            if room.get('chess_fen'):
+                for cp in room['players']:
+                    ws_send(cp['client_id'], {'type': 'chess_sync', 'fen': room['chess_fen'], 'history': room.get('chess_history', [])})
+        else:
+            ws_send(client_id, {'type': 'joined', 'color': color, 'players': player_list})
 
     elif safe_game == 'battleship':
         is_host = len(room['players']) == 1
@@ -528,13 +735,45 @@ def leave_room(client_id):
         room = rooms.get(room_id)
         if not room:
             return
+        removed_index = next((i for i, p in enumerate(room['players']) if p['client_id'] == client_id), None)
         room['clients'].discard(client_id)
         room['players'] = [p for p in room['players'] if p['client_id'] != client_id]
         if room['host'] == client_id and room['players']:
             room['host'] = room['players'][0]['client_id']
+        if removed_index is not None:
+            if room.get('game') == 'drawing' and room.get('players'):
+                if removed_index < room.get('drawer_index', 0):
+                    room['drawer_index'] = max(0, room.get('drawer_index', 0) - 1)
+                elif room.get('drawer_index', 0) >= len(room['players']):
+                    room['drawer_index'] = 0
+            if room.get('game') == 'wordgame' and room.get('players'):
+                if removed_index <= room.get('current_player_index', 0):
+                    room['current_player_index'] = max(-1, room.get('current_player_index', 0) - 1)
+                if room.get('current_player_index', 0) >= len(room['players']):
+                    room['current_player_index'] = -1
+            if room.get('game') == 'battleship' and len(room['players']) < 2:
+                room['bs_turn'] = 0
 
     player_list = get_player_list(room)
     broadcast_all(room, {'type': 'player_left', 'name': info.get('name'), 'players': player_list})
+
+    if room['game'] == 'wordgame' and room.get('game_running') and len(room['players']) <= 1:
+        cancel_timer(room, 'word_timer')
+        end_word_game(room)
+    elif room['game'] == 'drawing' and room.get('game_running') and len(room['players']) <= 1:
+        cancel_timer(room, 'round_timer')
+        end_drawing_game(room)
+    elif room['game'] == 'trivia' and room.get('game_running') and len(room['players']) <= 1:
+        cancel_timer(room, 'trivia_timer')
+        end_trivia(room)
+    elif room['game'] == 'bomberman' and room.get('game_running') and len(room['players']) <= 1:
+        end_bomberman(room, room['players'][0] if room['players'] else None)
+    elif room['game'] == 'pong' and room.get('pong', {}).get('running') and len(room['players']) <= 1:
+        room['pong']['running'] = False
+        stop_pong = room.get('pong', {}).get('stop')
+        if stop_pong:
+            stop_pong.set()
+        broadcast_all(room, {'type': 'opponent_left'})
 
     with _glock:
         if not room['players']:
@@ -562,7 +801,7 @@ def handle_message(client_id, msg, cookie_profile=None):
 
     if t == 'get_stats':
         ws_send(client_id, {'type': 'stats', **get_room_stats()})
-        ws_send(client_id, {'type': 'leaderboard', 'scores': leaderboard[:10]})
+        ws_send(client_id, {'type': 'leaderboard', 'scores': leaderboard[:50]})
         return None
 
     if t == 'join':
@@ -603,6 +842,9 @@ def handle_message(client_id, msg, cookie_profile=None):
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
 def start_drawing_game(room):
+    room['finalized'] = False
+    if room.get('game_running'):
+        return
     if len(room['players']) < 2:
         broadcast_all(room, {'type': 'waiting', 'message': 'Need at least 2 players!', 'canStart': True})
         return
@@ -621,6 +863,8 @@ def next_drawing_round(room):
         return
     room['round'] += 1
     room['current_word'] = rand_item(DRAWING_WORDS)
+    room['drawing_actions'] = []
+    room['round_deadline'] = time.time() + 60
     for p in room['players']:
         p['guessed'] = False
     drawer = room['players'][room['drawer_index'] % len(room['players'])]
@@ -663,6 +907,8 @@ def end_drawing_round(room):
 
 def end_drawing_game(room):
     room['game_running'] = False
+    room['finalized'] = True
+    room['trivia_deadline'] = 0
     sorted_p = sorted(room['players'], key=lambda p: -p['score'])
     winner = sorted_p[0] if sorted_p else None
     broadcast_all(room, {'type': 'game_over', 'winner': winner['name'] if winner else '?', 'players': get_player_list(room)})
@@ -676,9 +922,12 @@ def handle_drawing_msg(client_id, room, msg):
     drawer = room['players'][drawer_idx] if room['players'] else None
 
     if t == 'draw' and drawer and info.get('name') == drawer['name']:
-        broadcast(room, {'type': 'draw', 'action': msg.get('action'), 'x': msg.get('x'),
-                         'y': msg.get('y'), 'color': msg.get('color'), 'size': msg.get('size')}, client_id)
+        action_payload = {'type': 'draw', 'action': msg.get('action'), 'x': msg.get('x'),
+                         'y': msg.get('y'), 'color': msg.get('color'), 'size': msg.get('size')}
+        room.setdefault('drawing_actions', []).append(action_payload)
+        broadcast(room, action_payload, client_id)
     if t == 'draw_clear' and drawer and info.get('name') == drawer['name']:
+        room['drawing_actions'] = [{'type': 'draw_clear'}]
         broadcast(room, {'type': 'draw_clear'}, client_id)
     if t == 'guess':
         word = (msg.get('word') or '').lower().strip()
@@ -694,15 +943,17 @@ def handle_drawing_msg(client_id, room, msg):
             if drawer:
                 drawer['score'] += 20
         broadcast_all(room, {'type': 'guess_msg', 'name': info.get('name'), 'word': msg.get('word'), 'correct': correct})
-        non_drawers = [p for p in room['players'] if drawer and p['name'] != drawer['name']]
-        if non_drawers and all(p['guessed'] for p in non_drawers):
+        if correct:
             cancel_timer(room, 'round_timer')
-            t2 = threading.Timer(1.5, end_drawing_round, args=[room])
+            t2 = threading.Timer(1.0, end_drawing_round, args=[room])
             t2.daemon = True
             t2.start()
 
 # ── Word Bomb ─────────────────────────────────────────────────────────────────
 def start_word_game(room):
+    room['finalized'] = False
+    if room.get('game_running'):
+        return
     if len(room['players']) < 2:
         broadcast_all(room, {'type': 'waiting', 'message': 'Need at least 2 players!', 'canStart': True})
         return
@@ -713,6 +964,7 @@ def start_word_game(room):
         p['eliminated'] = False
     room['round'] = 0
     room['current_player_index'] = -1
+    room['word_used_words'] = set()
     broadcast_all(room, {'type': 'game_start'})
     next_word_turn(room)
 
@@ -729,15 +981,7 @@ def next_word_turn(room):
             break
     player = room['players'][room['current_player_index']]
     round_num = room.get('round', 0)
-    if round_num < 4:
-        pool = WORD_BOMB_SYLLABLES.get('easy', [])
-    elif round_num < 8:
-        pool = WORD_BOMB_SYLLABLES.get('medium', [])
-    else:
-        pool = WORD_BOMB_SYLLABLES.get('hard', [])
-    if not pool:
-        pool = WORD_BOMB_SYLLABLES.get('easy', []) + WORD_BOMB_SYLLABLES.get('medium', []) + WORD_BOMB_SYLLABLES.get('hard', [])
-    room['syllable'] = rand_item(pool)
+    room['syllable'] = choose_wordbomb_syllable(room)
     time_limit = max(5, 12 - round_num // max(len(alive), 1))
     player_list = get_player_list(room)
     for i, p in enumerate(player_list):
@@ -745,6 +989,7 @@ def next_word_turn(room):
     broadcast_all(room, {'type': 'turn', 'player': player['name'], 'syllable': room['syllable'],
                          'timeLeft': time_limit, 'players': player_list})
     cancel_timer(room, 'word_timer')
+    room['word_deadline'] = time.time() + time_limit
     room['word_timer'] = threading.Timer(time_limit, handle_word_timeout, args=[room, player])
     room['word_timer'].daemon = True
     room['word_timer'].start()
@@ -764,6 +1009,8 @@ def handle_word_timeout(room, player):
 
 def end_word_game(room):
     room['game_running'] = False
+    room['finalized'] = True
+    room['word_deadline'] = 0
     alive = [p for p in room['players'] if not p['eliminated']]
     winner = alive[0] if alive else sorted(room['players'], key=lambda p: -p['score'])[0] if room['players'] else None
     broadcast_all(room, {'type': 'game_over', 'winner': winner['name'] if winner else '?', 'players': get_player_list(room)})
@@ -779,10 +1026,15 @@ def handle_word_msg(client_id, room, msg):
         return
     raw_word = (msg.get('word') or '').strip()
     word = raw_word.upper()
+    normalized_word = ''.join(ch for ch in raw_word.lower() if ch.isalpha())
     syllable = room.get('syllable', '')
-    valid = syllable in word and len(word) >= 3 and word.isalpha() and is_valid_wordbomb_word(raw_word)
+    used_words = room.setdefault('word_used_words', set())
+    valid = (syllable in word and len(word) >= 3 and word.isalpha() and
+             normalized_word not in used_words and normalized_word != syllable.lower() and
+             is_valid_wordbomb_word(raw_word))
     cancel_timer(room, 'word_timer')
     if valid:
+        used_words.add(normalized_word)
         points = len(word) * 5
         current['score'] += points
         broadcast_all(room, {'type': 'word_result', 'player': info.get('name'), 'word': msg.get('word'),
@@ -811,9 +1063,66 @@ def handle_word_msg(client_id, room, msg):
 
 # ── Chess ─────────────────────────────────────────────────────────────────────
 def handle_chess_msg(client_id, room, msg):
-    if msg.get('type') == 'chess_move':
-        broadcast(room, {'type': 'chess_move', 'from': msg.get('from'), 'to': msg.get('to'),
-                         'promotion': msg.get('promotion'), 'fen': msg.get('fen')}, client_id)
+    if msg.get('type') != 'chess_move':
+        return
+    if len(room.get('players', [])) < 2:
+        ws_send(client_id, {'type': 'error', 'message': 'Waiting for the other player to join.', 'fen': room.get('chess_fen')})
+        return
+    player = next((p for p in room.get('players', []) if p.get('client_id') == client_id), None)
+    if not player:
+        return
+    if pychess is None:
+        return
+
+    board = room.get('chess_board')
+    if board is None:
+        try:
+            board = pychess.Board(room.get('chess_fen')) if room.get('chess_fen') else pychess.Board()
+        except Exception:
+            board = pychess.Board()
+        room['chess_board'] = board
+        room['chess_fen'] = board.fen()
+
+    expected_color = player.get('_chess_color')
+    if expected_color not in ('w', 'b') or board.turn != (expected_color == 'w'):
+        ws_send(client_id, {'type': 'error', 'message': 'Not your turn.', 'fen': room.get('chess_fen')})
+        return
+
+    from_sq = str(msg.get('from') or '').strip()
+    to_sq = str(msg.get('to') or '').strip()
+    promotion = str(msg.get('promotion') or '').strip().lower()
+
+    candidate_uci = [f"{from_sq}{to_sq}"]
+    if promotion in ('q', 'r', 'b', 'n'):
+        candidate_uci.insert(0, f"{from_sq}{to_sq}{promotion}")
+
+    move = None
+    for uci in candidate_uci:
+        try:
+            candidate = pychess.Move.from_uci(uci)
+        except Exception:
+            continue
+        if candidate in board.legal_moves:
+            move = candidate
+            break
+
+    if move is None:
+        ws_send(client_id, {'type': 'error', 'message': 'Illegal move.', 'fen': room.get('chess_fen')})
+        return
+
+    san = board.san(move)
+    board.push(move)
+    room['chess_fen'] = board.fen()
+    room.setdefault('chess_history', []).append(san)
+    ws_send(client_id, {'type': 'chess_sync', 'fen': room['chess_fen'], 'history': room.get('chess_history', [])})
+    broadcast(room, {
+        'type': 'chess_move',
+        'from': from_sq,
+        'to': to_sq,
+        'promotion': promotion if promotion in ('q','r','b','n') else None,
+        'fen': room['chess_fen'],
+        'history': room.get('chess_history', []),
+    }, client_id)
 
 # ── Pong ──────────────────────────────────────────────────────────────────────
 PONG_W, PONG_H = 800, 400
@@ -916,6 +1225,9 @@ def tick_pong(room):
 def end_pong(room, side):
     ps = room['pong']
     ps['running'] = False
+    room['finalized'] = True
+    for p in room.get('players', []):
+        p['_ready'] = False
     if ps.get('stop'):
         ps['stop'].set()
     winner_player = next((p for p in room['players'] if p.get('_side') == side), None)
@@ -938,6 +1250,10 @@ def handle_pong_msg(client_id, room, msg):
         if (len(room['players']) == 2 and
                 all(p.get('_ready') for p in room['players']) and
                 not room['pong']['running']):
+            room['finalized'] = False
+            room['pong']['scores'] = {'left': 0, 'right': 0}
+            room['pong']['paddles'] = {'left': 160.0, 'right': 160.0}
+            reset_pong_ball(room['pong'], 1 if random.random() < 0.5 else -1)
             broadcast_all(room, {'type': 'pong_start', 'scores': room['pong']['scores']})
             start_pong_loop(room)
 
@@ -950,11 +1266,23 @@ def handle_battleship_msg(client_id, room, msg):
 
     if t == 'bs_place':
         ships = msg.get('ships', [])
-        player['bs_ships'] = ships
         player['bs_grid'] = [[0]*10 for _ in range(10)]
+        occupied = set()
+        valid = True
         for ship in ships:
             for r, c in ship.get('cells', []):
-                player['bs_grid'][r][c] = 1
+                if not (0 <= r < 10 and 0 <= c < 10) or (r, c) in occupied:
+                    valid = False
+                    break
+                occupied.add((r, c))
+            if not valid:
+                break
+        if not valid:
+            ws_send(client_id, {'type': 'error', 'message': 'Invalid ship layout.'})
+            return
+        player['bs_ships'] = ships
+        for r, c in occupied:
+            player['bs_grid'][r][c] = 1
         player['bs_ready'] = True
         player['bs_sunk'] = 0
 
@@ -962,6 +1290,7 @@ def handle_battleship_msg(client_id, room, msg):
                       all(p.get('bs_ready') for p in room['players']))
         if both_ready:
             room['bs_turn'] = 0
+            room['bs_shots'] = {p['name']: [] for p in room['players']}
             for i, p in enumerate(room['players']):
                 ws_send(p['client_id'], {'type': 'bs_battle_start', 'yourTurn': i == 0})
         else:
@@ -981,6 +1310,7 @@ def handle_battleship_msg(client_id, room, msg):
 
         hit = defender['bs_grid'][row][col] == 1
         defender['bs_grid'][row][col] = 2 if hit else 3
+        room.setdefault('bs_shots', {}).setdefault(player['name'], []).append({'row': row, 'col': col, 'state': 2 if hit else 3})
 
         sunk_cells = None
         if hit:
@@ -999,6 +1329,7 @@ def handle_battleship_msg(client_id, room, msg):
                                   'sunk': bool(sunk_cells), 'sunkCells': sunk_cells, 'yourTurn': not same_turn})
 
         if defender['bs_sunk'] >= len(defender['bs_ships']):
+            room['finalized'] = True
             broadcast_all(room, {'type': 'bs_over', 'winner': player['name']})
             add_leaderboard(player['name'], 'Battleship', 1000)
         else:
@@ -1006,6 +1337,9 @@ def handle_battleship_msg(client_id, room, msg):
 
 # ── Trivia ────────────────────────────────────────────────────────────────────
 def start_trivia(room):
+    room['finalized'] = False
+    if room.get('game_running'):
+        return
     if len(room['players']) < 2:
         broadcast_all(room, {'type': 'waiting', 'message': 'Need at least 2 players!', 'canStart': True})
         return
@@ -1029,12 +1363,13 @@ def next_trivia_question(room):
     room['trivia_deadline'] = time.time() + 15
     for p in room['players']:
         p['trivia_answered'] = False
+    room['trivia_current_options'] = shuffle(q['opts'])
     broadcast_all(room, {
         'type': 'trivia_question',
         'round': room['trivia_round'] + 1,
         'total': len(room['trivia_questions']),
         'question': q['q'],
-        'options': shuffle(q['opts']),
+        'options': room['trivia_current_options'],
         'timeLimit': 15,
     })
     cancel_timer(room, 'trivia_timer')
@@ -1054,12 +1389,15 @@ def reveal_trivia_answer(room):
     broadcast_all(room, {'type': 'trivia_reveal', 'correct': q['a'],
                          'results': results, 'players': get_player_list(room)})
     room['trivia_round'] += 1
+    room['trivia_current_options'] = []
     t = threading.Timer(4.0, next_trivia_question, args=[room])
     t.daemon = True
     t.start()
 
 def end_trivia(room):
     room['game_running'] = False
+    room['finalized'] = True
+    room['trivia_deadline'] = 0
     sorted_p = sorted(room['players'], key=lambda p: -p['score'])
     winner = sorted_p[0] if sorted_p else None
     broadcast_all(room, {'type': 'game_over', 'winner': winner['name'] if winner else '?',
@@ -1071,7 +1409,8 @@ def handle_trivia_msg(client_id, room, msg):
     if msg.get('type') != 'trivia_answer':
         return
     player = next((p for p in room['players'] if p['client_id'] == client_id), None)
-    if not player or player.get('trivia_answered'):
+    if (not player or player.get('trivia_answered') or not room.get('game_running') or
+            room.get('trivia_round', 0) >= len(room.get('trivia_questions', []))):
         return
     player['trivia_answered'] = True
     q = room['trivia_questions'][room['trivia_round']]
@@ -1130,6 +1469,9 @@ def get_bomb_state(room):
     }
 
 def start_bomberman(room):
+    room['finalized'] = False
+    if room.get('game_running'):
+        return
     if len(room['players']) < 2:
         broadcast_all(room, {'type': 'waiting', 'message': 'Need at least 2 players!', 'canStart': True})
         return
@@ -1236,6 +1578,7 @@ def explode_bomb(room, bomb):
 
 def end_bomberman(room, winner):
     room['game_running'] = False
+    room['finalized'] = True
     stop_ev = room.get('bomb_stop')
     if stop_ev:
         stop_ev.set()
@@ -1251,6 +1594,9 @@ def handle_bomberman_msg(client_id, room, msg):
     t = msg.get('type')
 
     if t == 'bomb_move':
+        now = time.time()
+        if now - player.get('bomb_last_move_at', 0) < 0.06:
+            return
         r, c = msg.get('r', 0), msg.get('c', 0)
         if not (0 <= r < BOMB_MAP_H and 0 <= c < BOMB_MAP_W):
             return
@@ -1258,7 +1604,10 @@ def handle_bomberman_msg(client_id, room, msg):
             return
         if any(b['r'] == r and b['c'] == c for b in room['bombs']):
             return
+        if abs(player['bomb_pos']['r'] - r) + abs(player['bomb_pos']['c'] - c) != 1:
+            return
         player['bomb_pos'] = {'r': r, 'c': c}
+        player['bomb_last_move_at'] = now
         pu = next((p for p in room['powerups'] if p['r'] == r and p['c'] == c), None)
         if pu:
             if pu['type'] == 'power':
@@ -1288,10 +1637,12 @@ def handle_bomberman_msg(client_id, room, msg):
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 def cleanup_loop():
     client_ttl = 45
+    disconnect_grace = 45
     while True:
         time.sleep(10)
         now = time.time()
         stale_clients = []
+        expired_disconnected = []
         with _glock:
             dead = [rid for rid, r in rooms.items() if not r['clients']]
             for rid in dead:
@@ -1300,8 +1651,16 @@ def cleanup_loop():
                 cid for cid, info in list(clients.items())
                 if info.get('alive') and now - info.get('last_seen', now) > client_ttl
             ]
+            expired_disconnected = [
+                cid for cid, info in list(clients.items())
+                if (not info.get('alive')) and info.get('disconnected_at') and now - info.get('disconnected_at', now) > disconnect_grace
+            ]
         for cid in stale_clients:
             disconnect_client(cid)
+        for cid in expired_disconnected:
+            leave_room(cid)
+            clients.pop(cid, None)
+            broadcast_stats()
 
 leaderboard[:] = load_leaderboard()
 threading.Thread(target=cleanup_loop, daemon=True).start()

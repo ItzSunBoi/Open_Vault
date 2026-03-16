@@ -472,6 +472,8 @@ document.getElementById('roomInput').addEventListener('keydown', e => {
 });
 
 // WebSocket for online count
+let archiveLedgerLoaded = false;
+
 function connectStats() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -488,7 +490,7 @@ function connectStats() {
         document.getElementById('t-players').textContent = d.trivia || 0;
         document.getElementById('bm-players').textContent = d.bomberman || 0;
       }
-      if (d.type === 'leaderboard') renderArchiveLedger(d.scores);
+      if (d.type === 'leaderboard' && !archiveLedgerLoaded) { renderArchiveLedger(d.scores); archiveLedgerLoaded = true; }
     } catch(e){}
   };
   ws.onclose = () => setTimeout(connectStats, 3000);
@@ -497,15 +499,36 @@ function connectStats() {
 connectStats();
 
 function renderArchiveLedger(scores) {
-  if (!scores || !scores.length) return;
   const tbody = document.getElementById('leaderboard');
-  tbody.innerHTML = scores.slice(0,10).map((s,i) => `
-    <tr>
-      <td class="rank rank-${i+1}">${i+1}</td>
-      <td>${s.name}</td>
-      <td>${s.game}</td>
-      <td>${s.score}</td>
-    </tr>`).join('');
+  if (!scores || !scores.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:rgba(224,240,255,0.45);padding:12px">No ledger entries yet.</td></tr>';
+    return;
+  }
+  const groups = new Map();
+  for (const row of scores) {
+    if (!row || !row.game) continue;
+    if (!groups.has(row.game)) groups.set(row.game, []);
+    const bucket = groups.get(row.game);
+    if (bucket.length < 5) bucket.push(row);
+  }
+  const orderedGames = ['Drawing','Word Bomb','Chess','Pong','Battleship','Trivia','Bomberman'];
+  let html = '';
+  for (const game of orderedGames) {
+    const rows = groups.get(game) || [];
+    html += `<tr><td colspan="4" style="padding-top:14px;color:#00ffaa;font-family:Orbitron,monospace;letter-spacing:1px">${game}</td></tr>`;
+    if (!rows.length) {
+      html += '<tr><td colspan="4" style="color:rgba(224,240,255,0.35)">No entries yet.</td></tr>';
+      continue;
+    }
+    html += rows.map((s,i) => `
+      <tr>
+        <td class="rank rank-${Math.min(i+1,3)}">${i+1}</td>
+        <td>${s.name}</td>
+        <td>${s.game}</td>
+        <td>${s.score}</td>
+      </tr>`).join('');
+  }
+  tbody.innerHTML = html;
 }
 </script>
 </body>

@@ -63,6 +63,12 @@ canvas { display:block;image-rendering:pixelated; }
   .ping-badge[data-quality="good"]{color:#00ffaa;border-color:rgba(0,255,170,0.28);}
   .ping-badge[data-quality="ok"]{color:#ffcc00;border-color:rgba(255,204,0,0.28);}
   .ping-badge[data-quality="poor"]{color:#ff6677;border-color:rgba(255,102,119,0.28);}
+
+  .ledger-panel{position:fixed;right:10px;bottom:10px;width:220px;max-height:260px;overflow:auto;background:rgba(5,7,15,0.92);border:1px solid rgba(0,255,170,0.15);border-radius:12px;padding:10px;z-index:40;backdrop-filter:blur(4px);} 
+  .ledger-title{font-family:'Orbitron',monospace;font-size:11px;letter-spacing:2px;color:#00ffaa;margin-bottom:8px;text-transform:uppercase;}
+  .ledger-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:rgba(224,240,255,0.82);padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);} 
+  .ledger-row:last-child{border-bottom:none;} .ledger-rank{color:#00ffaa;font-family:'Orbitron',monospace;width:20px;} .ledger-empty{font-size:12px;color:rgba(224,240,255,0.45);} 
+
 </style>
 </head>
 <body>
@@ -87,16 +93,27 @@ canvas { display:block;image-rendering:pixelated; }
   <button id="bomb-btn">💣</button>
   <div class="overlay show" id="overlay">
     <h2 id="ov-title">VAULT BLAST</h2>
+    <div style="font-family:'Orbitron',monospace;font-size:20px;color:#00ffaa;letter-spacing:4px;padding:10px 14px;border:1px solid rgba(0,255,170,0.25);border-radius:10px;background:rgba(0,255,170,0.06)">ROOM <span id="overlay-room-code">---</span></div>
     <p id="ov-msg">Place bombs, destroy blocks, eliminate opponents!</p>
     <div class="players-pre" id="players-pre"></div>
-    <button class="btn" id="start-btn" disabled onclick="sendStart()">Begin Sequence</button>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+      <button class="btn" id="start-btn" disabled onclick="sendStart()">Begin Sequence</button>
+      <button class="btn" type="button" onclick="copyRoomLink()">Copy Room Link</button>
+    </div>
     <p style="font-size:12px;color:rgba(255,120,0,0.4);font-family:Orbitron,monospace" id="hint-txt">Waiting for players...</p>
   </div>
 </div>
 
 <script>
+const LEDGER_GAME = 'Bomberman';
 const { roomId, playerName: myName } = GameVaultMP.normalizeMultiplayerParams({ defaultName: 'Player' });
 document.getElementById('room-tag').textContent = 'ROOM: ' + roomId;
+document.getElementById('overlay-room-code').textContent = roomId;
+
+function copyRoomLink() {
+  const url = `${location.origin}/vault-blast/?room=${encodeURIComponent(roomId)}`;
+  navigator.clipboard.writeText(url).then(() => {}).catch(() => alert(url));
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const TILE = 40;
@@ -138,14 +155,25 @@ window.addEventListener('resize', () => { TILE_PX = resizeCanvas(); });
 const wsProto = location.protocol==='https:'?'wss':'ws';
 const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
 GameVaultMP.bindPingDisplay(ws, 'ping-badge');
-ws.onopen    = () => ws.send(JSON.stringify({type:'join',room:roomId,name:myName,game:'bomberman'}));
+ws.onopen    = () => ws.send(JSON.stringify({type:'join',room:roomId,name:myName,game:'bomberman'})); ws.send(JSON.stringify({type:'get_stats'}));
 ws.onmessage = e => { const d = JSON.parse(e.data); if (d.type === 'join_error') { alert(d.error || 'Unable to join this room.'); return; } handleMsg(d); };
 ws.onclose   = () => document.getElementById('hint-txt').textContent = 'Disconnected. Refresh to reconnect.';
 function send(o) { if(ws.readyState===1) ws.send(JSON.stringify(o)); }
 
 // ── Message handler ───────────────────────────────────────────────────────────
+
+function renderLedger(scores) {
+  scores = (scores || []).filter(s => s && s.game === LEDGER_GAME);
+  const el = document.getElementById('ledger-list');
+  if (!el) return;
+  if (!scores || !scores.length) { el.innerHTML = '<div class="ledger-empty">No ledger entries yet.</div>'; return; }
+  el.innerHTML = scores.slice(0,10).map((s,i)=>`<div class="ledger-row"><span class="ledger-rank">${i+1}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</span><span>${s.score}</span></div>`).join('');
+}
 function handleMsg(msg) {
   switch(msg.type) {
+    case 'leaderboard':
+      renderLedger(msg.scores);
+      break;
     case 'joined':
       isHost = msg.isHost;
       updateLobby(msg.players);
@@ -415,5 +443,6 @@ function loop() {
 TILE_PX = resizeCanvas();
 requestAnimationFrame(loop);
 </script>
+<div class="ledger-panel"><div class="ledger-title">Archive Ledger</div><div id="ledger-list" class="ledger-empty">Waiting for ledger…</div></div>
 </body>
 </html>
