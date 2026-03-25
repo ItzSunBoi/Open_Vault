@@ -1,0 +1,7 @@
+<!doctype html><html><head><script src="/http-socket.js"></script><script src="/multiplayer-common.js"></script><meta charset="utf-8"><title>Vault Mafia Lite</title><style>body{background:#05070f;color:#e0f0ff;font-family:Rajdhani,sans-serif;padding:20px}.btn{background:#ff8800;border:0;padding:8px 12px;border-radius:8px;margin:3px}</style></head><body><a href="/vault">← Back</a><h2>Vault Mafia Lite</h2><div id="s"></div><div id="players"></div><button class="btn" id="start">Start</button><h4>Target</h4><input id="target"><button class="btn" id="act">Night Action</button><button class="btn" id="vote">Vote</button><pre id="log"></pre>
+<script>
+const {roomId,playerName}=GameVaultMP.normalizeMultiplayerParams({defaultName:'Player'});let ws;
+function render(m){s.textContent=`Day ${m.day} - ${m.phase} - Role: ${m.role}${m.winner?(' Winner: '+m.winner):''}`;players.textContent='Alive: '+Object.entries(m.alive||{}).filter(x=>x[1]).map(x=>x[0]).join(', ');log.textContent=(m.log||[]).join('\n');}
+ws=GameVaultMP.createSocket();ws.onopen=()=>ws.send(JSON.stringify({type:'join',game:'mafia',room:roomId,name:playerName}));ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='mafia_state')render(m);};
+start.onclick=()=>ws.send(JSON.stringify({type:'start_game'}));act.onclick=()=>ws.send(JSON.stringify({type:'mafia_night_action',target:target.value.trim()}));vote.onclick=()=>ws.send(JSON.stringify({type:'mafia_vote',target:target.value.trim()}));
+</script></body></html>

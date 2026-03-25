@@ -1,0 +1,9 @@
+<!doctype html><html><head><script src="/http-socket.js"></script><script src="/multiplayer-common.js"></script><meta charset="utf-8"><title>Vault Curve Fever</title><style>body{background:#05070f;color:#e0f0ff;font-family:Rajdhani,sans-serif;padding:20px}.btn{background:#ff50c8;border:0;padding:8px 12px;border-radius:8px}canvas{background:#0b1021;border:1px solid #2d3f77}</style></head><body><a href="/vault">← Back</a><h2>Vault Curve Fever</h2><button class="btn" id="start">Start</button><div id="s"></div><canvas id="c" width="800" height="500"></canvas>
+<script>
+const {roomId,playerName}=GameVaultMP.normalizeMultiplayerParams({defaultName:'Player'});let ws,state={players:[]};const cv=c.getContext('2d');let left=false,right=false;
+function draw(){cv.clearRect(0,0,800,500);(state.players||[]).forEach((p,i)=>{cv.strokeStyle=['#00ffaa','#00aaff','#ff8800','#ff50c8'][i%4];cv.beginPath();(p.trail||[]).forEach((t,j)=>{if(j===0)cv.moveTo(t[0],t[1]);else cv.lineTo(t[0],t[1]);});cv.stroke();if(p.alive){cv.fillStyle=cv.strokeStyle;cv.fillRect(p.x-2,p.y-2,4,4);}});s.textContent=state.winner?('Winner: '+state.winner):'Alive: '+(state.players||[]).filter(p=>p.alive).length;}
+function tick(){if(ws){ws.send(JSON.stringify({type:'curve_input',left,right}));ws.send(JSON.stringify({type:'curve_tick'}));}requestAnimationFrame(tick);}requestAnimationFrame(tick);
+window.addEventListener('keydown',e=>{if(e.key==='ArrowLeft')left=true;if(e.key==='ArrowRight')right=true;});window.addEventListener('keyup',e=>{if(e.key==='ArrowLeft')left=false;if(e.key==='ArrowRight')right=false;});
+ws=GameVaultMP.createSocket();ws.onopen=()=>ws.send(JSON.stringify({type:'join',game:'curvefever',room:roomId,name:playerName}));ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='curve_state'){state=m;draw();}};
+start.onclick=()=>ws.send(JSON.stringify({type:'start_game'}));
+</script></body></html>

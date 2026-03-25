@@ -346,6 +346,11 @@
         </div>
       </div>
     </a>
+    <a class="vault-card c-neon" onclick="openPartyRoom('connect4','🔴 Vault Connect'); return false;" href="#"><div class="vault-thumb">🔴</div><div class="vault-info"><div class="vault-name">Vault Connect</div><div class="vault-desc">Drop discs and line up four signals.</div><div class="vault-meta"><span class="vault-tag tag-multi">Party</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openPartyRoom('uno','🃏 Vault Uno'); return false;" href="#"><div class="vault-thumb">🃏</div><div class="vault-info"><div class="vault-name">Vault Uno</div><div class="vault-desc">Play action cards and empty your hand first.</div><div class="vault-meta"><span class="vault-tag tag-multi">Party</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openPartyRoom('codenames','🕵️ Vault Codenames'); return false;" href="#"><div class="vault-thumb">🕵️</div><div class="vault-info"><div class="vault-name">Vault Codenames</div><div class="vault-desc">Spymasters guide guessers with one-word clues.</div><div class="vault-meta"><span class="vault-tag tag-multi">Party</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openPartyRoom('mafia','🌙 Vault Mafia'); return false;" href="#"><div class="vault-thumb">🌙</div><div class="vault-info"><div class="vault-name">Vault Mafia</div><div class="vault-desc">Survive day/night votes with hidden roles.</div><div class="vault-meta"><span class="vault-tag tag-multi">Party</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openPartyRoom('curvefever','🌀 Vault Curve'); return false;" href="#"><div class="vault-thumb">🌀</div><div class="vault-info"><div class="vault-name">Vault Curve</div><div class="vault-desc">Steer your trail and avoid collisions.</div><div class="vault-meta"><span class="vault-tag tag-multi">Party</span></div></div></a>
   </div>
 
   <div class="section-title">Shared Vaults</div>
@@ -427,6 +432,11 @@
         </div>
       </div>
     </a>
+    <a class="vault-card c-neon" onclick="openRoom('connect4','🔴 Vault Connect',true); return false;" href="#"><div class="vault-thumb">🔴</div><div class="vault-info"><div class="vault-name">Vault Connect</div><div class="vault-desc">Drop discs and line up four signals.</div><div class="vault-meta"><span class="vault-tag tag-multi">2 Seats</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openRoom('uno','🃏 Vault Uno',true); return false;" href="#"><div class="vault-thumb">🃏</div><div class="vault-info"><div class="vault-name">Vault Uno</div><div class="vault-desc">Play action cards and empty your hand first.</div><div class="vault-meta"><span class="vault-tag tag-multi">2+ Seats</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openRoom('codenames','🕵️ Vault Codenames',true); return false;" href="#"><div class="vault-thumb">🕵️</div><div class="vault-info"><div class="vault-name">Vault Codenames</div><div class="vault-desc">Spymasters guide guessers with one-word clues.</div><div class="vault-meta"><span class="vault-tag tag-multi">4+ Seats</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openRoom('mafia','🌙 Vault Mafia',true); return false;" href="#"><div class="vault-thumb">🌙</div><div class="vault-info"><div class="vault-name">Vault Mafia</div><div class="vault-desc">Survive day/night votes with hidden roles.</div><div class="vault-meta"><span class="vault-tag tag-multi">4+ Seats</span></div></div></a>
+    <a class="vault-card c-neon" onclick="openRoom('curvefever','🌀 Vault Curve',true); return false;" href="#"><div class="vault-thumb">🌀</div><div class="vault-info"><div class="vault-name">Vault Curve</div><div class="vault-desc">Steer your trail and avoid collisions.</div><div class="vault-meta"><span class="vault-tag tag-multi">2+ Seats</span></div></div></a>
   </div>
 
   <div class="section-title">Private Vaults</div>
@@ -523,6 +533,11 @@ const pathMap = {
   battleship: 'vault-fleet',
   trivia: 'vault-quiz',
   bomberman: 'vault-blast',
+  connect4: 'vault-connect4',
+  uno: 'vault-uno',
+  codenames: 'vault-codenames',
+  mafia: 'vault-mafia',
+  curvefever: 'vault-curve',
   minesweeper: 'vault-mine',
   flapty: 'vault-wing',
   neonrun: 'vault-neon',
